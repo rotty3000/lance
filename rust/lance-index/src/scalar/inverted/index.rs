@@ -1572,6 +1572,12 @@ impl TokenSet {
             },
         );
 
+        // The surviving token ids were just compacted into a dense `[0, len)`
+        // range, so `next_id` (the id allocator) must follow. Leaving it stale
+        // makes a later `get_or_add` mint an id past the posting-list vector,
+        // which `merge_from` sizes by `len()` -> out-of-bounds panic (knowdb #171).
+        self.next_id = map.len() as u32;
+
         self.tokens = TokenMap::HashMap(map);
     }
 
@@ -4406,6 +4412,33 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    // Regression: `TokenSet::remap` compacts surviving token ids into a dense
+    // `[0, len)` range but must also shrink `next_id` to match. A stale
+    // `next_id` (> len) makes a later `get_or_add` mint a token id past the end
+    // of the posting-list vector (sized by `len()`), causing an out-of-bounds
+    // panic in `InnerBuilder::merge_from` (builder.rs:856). See knowdb #171:
+    // `index out of bounds: the len is 80007 but the index is 80092`.
+    #[test]
+    fn token_set_remap_resets_next_id_to_len() {
+        let mut tokens = TokenSet::default();
+        for t in ["alpha", "bravo", "charlie", "delta", "echo"] {
+            tokens.add(t.to_string());
+        }
+        assert_eq!(tokens.len(), 5);
+        assert_eq!(tokens.next_id(), 5);
+
+        // Drop token ids 1 ("bravo") and 3 ("delta"); survivors compact to 0,1,2.
+        tokens.remap(&[1, 3]);
+
+        assert_eq!(tokens.len(), 3, "two tokens removed");
+        assert_eq!(
+            tokens.next_id(),
+            3,
+            "next_id must equal len after remap so a later get_or_add can't \
+             mint a token id past the posting-list vector sized by len()"
+        );
+    }
 
     async fn write_single_partition_index(
         store: Arc<LanceIndexStore>,
