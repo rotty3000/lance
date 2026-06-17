@@ -70,12 +70,25 @@ impl MemTableFlusher {
             path_str
         };
 
-        // Combine base_uri with relative path
-        let base = self.base_uri.trim_end_matches('/');
-        if relative.is_empty() {
+        // Combine base_uri with relative path. Split off any query string
+        // (e.g. the `s3+ddb://…?ddbTableName=…` commit-store table) FIRST, so
+        // the relative path is inserted into the PATH component rather than
+        // appended onto the query value — otherwise the flushed-generation
+        // dataset URI becomes `…?ddbTableName=lance_commit/_mem_wal/<shard>/<gen>`
+        // and the DynamoDB commit gets an invalid table name.
+        let (base_no_query, query) = match self.base_uri.split_once('?') {
+            Some((b, q)) => (b, Some(q)),
+            None => (self.base_uri.as_str(), None),
+        };
+        let base = base_no_query.trim_end_matches('/');
+        let joined = if relative.is_empty() {
             base.to_string()
         } else {
             format!("{}/{}", base, relative)
+        };
+        match query {
+            Some(q) => format!("{}?{}", joined, q),
+            None => joined,
         }
     }
 

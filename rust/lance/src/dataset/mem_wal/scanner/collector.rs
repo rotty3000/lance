@@ -266,7 +266,23 @@ impl LsmDataSourceCollector {
     /// Flushed MemTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
     /// The `folder_name` is what's stored in `FlushedGeneration.path`.
     fn resolve_flushed_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
-        format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name)
+        // Split off any query string (e.g. `s3+ddb://…?ddbTableName=…`) FIRST so
+        // the `_mem_wal/...` path is inserted into the PATH component, not
+        // appended onto the query value — otherwise the flushed-generation URI
+        // becomes `…?ddbTableName=lance_commit/_mem_wal/<shard>/<gen>` and the
+        // DynamoDB commit handler is built with an invalid table name.
+        match self.base_path.split_once('?') {
+            Some((base, query)) => {
+                format!(
+                    "{}/_mem_wal/{}/{}?{}",
+                    base.trim_end_matches('/'),
+                    shard_id,
+                    folder_name,
+                    query
+                )
+            }
+            None => format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name),
+        }
     }
 }
 
