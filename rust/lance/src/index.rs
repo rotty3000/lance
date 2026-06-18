@@ -1165,7 +1165,13 @@ impl DatasetIndexExt for Dataset {
                 // We shouldn't have any indices with empty fields, but just in case, log an error
                 // but don't fail the operation (we might not be using that index)
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    // FRAG_REUSE and MEM_WAL are fieldless pseudo-indices BY DESIGN
+                    // (the MemWAL index carries generation bookkeeping in its
+                    // index_details, not column fields). They are filtered out of
+                    // scalar-index resolution here on every commit / merge_insert,
+                    // so logging an error for them floods the logs (e.g. the LSM
+                    // compactor's per-merge "Index __lance_mem_wal has no fields").
+                    if idx.name != FRAG_REUSE_INDEX_NAME && idx.name != MEM_WAL_INDEX_NAME {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
