@@ -16,7 +16,7 @@ use arrow_schema::DataType;
 use async_trait::async_trait;
 use lance_core::{Error, Result};
 use lance_encoding::version::LanceFileVersion;
-use lance_index::frag_reuse::FRAG_REUSE_INDEX_NAME;
+use lance_index::is_system_index;
 use lance_index::pb::VectorIndexDetails;
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_table::format::IndexMetadata;
@@ -63,7 +63,13 @@ impl IndexRemapper for DatasetIndexRemapper {
         let indices = self.dataset.load_indices().await?;
         let mut remapped = Vec::with_capacity(indices.len());
         for index in indices.iter() {
-            let needs_remapped = index.name != FRAG_REUSE_INDEX_NAME
+            // System indices (frag-reuse AND mem-wal) carry no `fields` and must
+            // NOT be remapped: `remap_index` does `fields.first().expect(...)` and
+            // would panic on the fieldless mem-wal index. The original guard only
+            // excluded frag-reuse by name, so a mem-wal index (present whenever the
+            // LSM/MemWAL write path is used) crashed compaction. `is_system_index`
+            // covers both.
+            let needs_remapped = !is_system_index(index)
                 && match &index.fragment_bitmap {
                     None => true,
                     Some(fragment_bitmap) => fragment_bitmap

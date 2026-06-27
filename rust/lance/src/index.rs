@@ -433,6 +433,15 @@ pub(crate) async fn remap_index(
         ));
     }
 
+    // Defense-in-depth: a fieldless index (the mem-wal / frag-reuse system
+    // pseudo-indices carry `fields: []`) cannot be remapped column-wise. Callers
+    // should already skip system indices (see `DatasetIndexRemapper::remap_indices`),
+    // but returning Keep here instead of falling through to the `.first().expect()`
+    // below guarantees no fieldless index can ever abort the process.
+    if matched.fields.is_empty() {
+        return Ok(RemapResult::Keep(*index_id));
+    }
+
     if row_id_map.values().all(|v| v.is_none()) {
         let deleted_bitmap = RoaringBitmap::from_iter(
             row_id_map
