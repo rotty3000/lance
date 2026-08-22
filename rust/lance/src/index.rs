@@ -908,6 +908,16 @@ pub(crate) async fn remap_index(
         return Ok(RemapResult::Keep(*index_id));
     }
 
+    // Defense in depth: a fieldless index cannot be remapped column-wise, and
+    // reaching the `expect` below aborts the process mid-compaction. Callers
+    // already skip system indices via `is_system_index` in
+    // `DatasetIndexRemapper::remap_indices`, so this is unreachable today; it
+    // exists so a future caller that forgets cannot turn that omission into a
+    // crash.
+    if matched.fields.is_empty() {
+        return Ok(RemapResult::Keep(*index_id));
+    }
+
     let field_id = matched
         .fields
         .first()
@@ -1813,7 +1823,11 @@ impl DatasetIndexExt for Dataset {
                 // We shouldn't have any indices with empty fields, but just in case, log an error
                 // but don't fail the operation (we might not be using that index)
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    // The system pseudo-indices are fieldless BY DESIGN — MemWAL keeps its
+                    // generation bookkeeping in index_details, not column fields — and are
+                    // filtered out here on every commit and merge_insert. Logging them floods
+                    // the log of anything running a per-merge loop, e.g. an LSM compactor.
+                    if !is_system_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
