@@ -195,6 +195,44 @@ pub fn pk_index_path(gen_path: &Path) -> Path {
     gen_path.clone().join(PK_INDEX_DIR)
 }
 
+/// Join a sub-path onto a dataset URI, preserving any query string.
+///
+/// A dataset URI may carry a query — the `s3+ddb://…?ddbTableName=…` commit
+/// store is the case that matters — so appending the sub-path directly lands it
+/// inside the query VALUE rather than the path:
+///
+/// ```text
+/// s3+ddb://bucket/tbl.lance?ddbTableName=lance_commit  +  _mem_wal/<shard>/<gen>
+///   naive: …?ddbTableName=lance_commit/_mem_wal/<shard>/<gen>   <- invalid table name
+///   here:  …/_mem_wal/<shard>/<gen>?ddbTableName=lance_commit
+/// ```
+///
+/// The DynamoDB commit handler is then built with a table name DynamoDB rejects
+/// (`TableName must satisfy [a-zA-Z0-9_.-]+`), so every flush and compaction
+/// against an `s3+ddb` dataset fails. Only datasets that actually FLUSH hit it,
+/// which is why local-filesystem and put-only paths never surfaced it.
+///
+/// An empty `relative` returns the base unchanged, query included.
+pub fn join_dataset_uri(base_uri: &str, relative: &str) -> String {
+    let (base_no_query, query) = match base_uri.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (base_uri, None),
+    };
+    let base = base_no_query.trim_end_matches('/');
+    let relative = relative.trim_start_matches('/');
+
+    let joined = if relative.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}/{}", base, relative)
+    };
+
+    match query {
+        Some(q) => format!("{}?{}", joined, q),
+        None => joined,
+    }
+}
+
 /// Generate an 8-character random hex string for SSTable directories.
 pub fn generate_random_hash() -> String {
     let bytes: [u8; 4] = rand::random();
@@ -221,6 +259,46 @@ pub fn manifest_filename(version: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[rstest::rstest]
+    // The defect: a query-bearing commit-store URI must not absorb the sub-path.
+    #[case::query_preserved(
+        "s3+ddb://bucket/tbl.lance?ddbTableName=lance_commit",
+        "_mem_wal/abc/gen_1",
+        "s3+ddb://bucket/tbl.lance/_mem_wal/abc/gen_1?ddbTableName=lance_commit"
+    )]
+    // An empty relative still keeps the query: this is the base's own URI.
+    #[case::empty_relative_keeps_query(
+        "s3+ddb://bucket/tbl.lance?ddbTableName=lance_commit",
+        "",
+        "s3+ddb://bucket/tbl.lance?ddbTableName=lance_commit"
+    )]
+    #[case::no_query(
+        "s3://bucket/tbl.lance",
+        "_mem_wal/abc",
+        "s3://bucket/tbl.lance/_mem_wal/abc"
+    )]
+    #[case::no_query_empty_relative("s3://bucket/tbl.lance", "", "s3://bucket/tbl.lance")]
+    // Trailing slash on the base and a leading slash on the relative must not
+    // produce a doubled separator.
+    #[case::trailing_slash(
+        "file:///data/tbl.lance/",
+        "_mem_wal/x",
+        "file:///data/tbl.lance/_mem_wal/x"
+    )]
+    #[case::leading_slash(
+        "file:///data/tbl.lance",
+        "/_mem_wal/x",
+        "file:///data/tbl.lance/_mem_wal/x"
+    )]
+    #[case::trailing_slash_with_query(
+        "s3+ddb://bucket/tbl.lance/?ddbTableName=t",
+        "_mem_wal/x",
+        "s3+ddb://bucket/tbl.lance/_mem_wal/x?ddbTableName=t"
+    )]
+    fn test_join_dataset_uri(#[case] base: &str, #[case] relative: &str, #[case] expected: &str) {
+        assert_eq!(join_dataset_uri(base, relative), expected);
+    }
 
     #[test]
     fn test_bit_reverse_u64() {

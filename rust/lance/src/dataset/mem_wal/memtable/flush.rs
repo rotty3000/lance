@@ -32,7 +32,9 @@ use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
 use crate::dataset::mem_wal::scanner::exec::{compute_pk_hash, validate_pk_types};
-use crate::dataset::mem_wal::util::{derived_store_params, generate_random_hash, sstable_path};
+use crate::dataset::mem_wal::util::{
+    derived_store_params, generate_random_hash, join_dataset_uri, sstable_path,
+};
 use crate::session::Session;
 
 #[derive(Debug, Clone)]
@@ -178,12 +180,7 @@ impl MemTableFlusher {
             path_str
         };
 
-        let base = self.base_uri.trim_end_matches('/');
-        if relative.is_empty() {
-            base.to_string()
-        } else {
-            format!("{}/{}", base, relative)
-        }
+        join_dataset_uri(&self.base_uri, relative)
     }
 
     /// Storage file version of the shard's base dataset. SSTables

@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use super::data_source::{LsmDataSource, LsmGeneration, ShardSnapshot};
 use crate::dataset::Dataset;
+use crate::dataset::mem_wal::util::join_dataset_uri;
 use crate::dataset::mem_wal::write::{BatchStore, IndexStore};
 
 /// A point-in-time handle to one in-memory memtable, active or frozen —
@@ -336,7 +337,10 @@ impl LsmDataSourceCollector {
     /// SSTables are stored at: `{base_path}/_mem_wal/{shard_id}/{folder_name}`
     /// The `folder_name` is what's stored in `SsTable.path`.
     fn resolve_sstable_path(&self, shard_id: &Uuid, folder_name: &str) -> String {
-        format!("{}/_mem_wal/{}/{}", self.base_path, shard_id, folder_name)
+        join_dataset_uri(
+            &self.base_path,
+            &format!("_mem_wal/{}/{}", shard_id, folder_name),
+        )
     }
 }
 

@@ -26,7 +26,7 @@ use crate::index::mem_wal::{load_mem_wal_index_details, new_mem_wal_index_meta};
 use super::ShardWriterConfig;
 use super::scanner::sstable_cache::open_sstable;
 use super::scanner::{DatasetCache, ShardSnapshot};
-use super::util::derived_store_params;
+use super::util::{derived_store_params, join_dataset_uri};
 use super::write::MemIndexConfig;
 use super::write::ShardWriter;
 
@@ -589,7 +589,7 @@ impl DatasetMemWalExt for Dataset {
         let store_params = self.store_params().map(derived_store_params);
         // Resolve SSTable paths exactly as the LSM collector does, so the
         // session/cache entries we warm key-match the paths later lookups open.
-        let base_path = self.uri().trim_end_matches('/').to_string();
+        let base_path = self.uri().to_string();
         let opens = snapshots
             .iter()
             .flat_map(|snapshot| {
@@ -598,7 +598,10 @@ impl DatasetMemWalExt for Dataset {
                 let session = &session;
                 let store_params = &store_params;
                 snapshot.sstables.iter().map(move |sstable| {
-                    let path = format!("{}/_mem_wal/{}/{}", base_path, shard_id, sstable.path);
+                    let path = join_dataset_uri(
+                        base_path,
+                        &format!("_mem_wal/{}/{}", shard_id, sstable.path),
+                    );
                     async move {
                         let dataset =
                             open_sstable(&path, Some(session), store_params.as_ref(), cache, None)
