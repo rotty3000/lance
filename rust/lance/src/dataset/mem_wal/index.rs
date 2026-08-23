@@ -237,7 +237,12 @@ pub fn validate_index_configs(
 }
 
 /// Types `pk_key::encode_value` can encode into an order-preserving composite key.
-fn is_encodable_pk_type(data_type: &DataType) -> bool {
+///
+/// Kept `pub(crate)` so the scanner's hash allow-list
+/// ([`super::scanner::exec::pk::is_supported_pk_type`]) can be tested against
+/// it: a type accepted here but rejected there builds a PK index that cannot
+/// then be scanned.
+pub(crate) fn is_encodable_pk_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Int8

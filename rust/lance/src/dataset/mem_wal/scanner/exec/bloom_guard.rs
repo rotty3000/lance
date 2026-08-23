@@ -231,11 +231,19 @@ pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) 
             datafusion::common::ScalarValue::UInt16(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::UInt32(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::UInt64(v) => hash_opt(&mut hasher, v),
+            // Hashed as the raw day/millisecond count, matching `Date32Array`
+            // / `Date64Array` in `super::compute_pk_hash`.
+            datafusion::common::ScalarValue::Date32(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Date64(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Boolean(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Utf8(v)
             | datafusion::common::ScalarValue::LargeUtf8(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Binary(v)
             | datafusion::common::ScalarValue::LargeBinary(v) => hash_opt(&mut hasher, v),
+            // The declared width is not hashed, matching both the array path in
+            // `super::compute_pk_hash` and `ScalarValue`'s own equality, which
+            // compares FixedSizeBinary by bytes alone.
+            datafusion::common::ScalarValue::FixedSizeBinary(_, v) => hash_opt(&mut hasher, v),
             // Unsupported types: validated out at the scanner boundary, but
             // distinguish by value rather than collapse if reached.
             _ => {

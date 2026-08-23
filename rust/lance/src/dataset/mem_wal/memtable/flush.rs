@@ -1185,7 +1185,7 @@ impl std::fmt::Debug for TriggerMemTableFlush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch, StringArray};
+    use arrow_array::{FixedSizeBinaryArray, Int32Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema as ArrowSchema};
     use lance_index::scalar::inverted::INVERTED_INDEX_VERSION_V2;
     use std::sync::Arc;
@@ -1499,6 +1499,108 @@ mod tests {
         assert_eq!(rows.get(&1), Some(&"a2".to_string()));
         assert_eq!(rows.get(&2), Some(&"b".to_string()));
         assert_eq!(rows.get(&3), Some(&"c2".to_string()));
+    }
+
+    /// A content-addressed `FixedSizeBinary` key must deduplicate on flush
+    /// exactly like an `Int32` one. This covers the flush-path
+    /// `validate_pk_types` call and the hashing arms it gates: a key hashed by
+    /// debug string, or collapsed to its declared width, changes the survivor
+    /// count rather than erroring, so only an end-to-end assertion catches it.
+    #[tokio::test]
+    async fn test_flush_dedups_fixed_size_binary_primary_key() {
+        use futures::TryStreamExt;
+
+        let (store, base_path, base_uri, _temp_dir) = create_local_store().await;
+        let shard_id = Uuid::new_v4();
+        let manifest_store = Arc::new(ShardManifestStore::new(
+            store.clone(),
+            &base_path,
+            shard_id,
+            2,
+        ));
+        let (epoch, _manifest) = manifest_store.claim_epoch(0).await.unwrap();
+
+        let mut pk_metadata = std::collections::HashMap::new();
+        pk_metadata.insert(
+            "lance-schema:unenforced-primary-key".to_string(),
+            "true".to_string(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("content_hash", DataType::FixedSizeBinary(32), false)
+                .with_metadata(pk_metadata),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let key = |b: u8| [b; 32];
+        // Append order (newest last): key 1 a->a2, key 2 b, key 3 c->c2.
+        let keys = [key(1), key(2), key(3), key(1), key(3)];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(FixedSizeBinaryArray::try_from_iter(keys.iter()).unwrap()),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "a2", "c2"])),
+            ],
+        )
+        .unwrap();
+
+        let mut memtable = MemTable::new(schema.clone(), 1, vec![0]).unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        let durable = frag_id + 1;
+
+        let flusher = MemTableFlusher::new(
+            store.clone(),
+            base_path,
+            base_uri.clone(),
+            shard_id,
+            manifest_store,
+        );
+        let result = flusher.flush(&memtable, epoch, 1, durable).await.unwrap();
+        assert_eq!(result.rows_flushed, 5, "all physical rows are written");
+
+        let gen_uri = format!(
+            "{}/_mem_wal/{}/{}",
+            base_uri.trim_end_matches('/'),
+            shard_id,
+            result.sstable.path
+        );
+        let dataset = Dataset::open(&gen_uri).await.unwrap();
+        let batches: Vec<RecordBatch> = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        let mut rows = std::collections::HashMap::new();
+        for b in &batches {
+            let hashes = b
+                .column_by_name("content_hash")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            let names = b
+                .column_by_name("name")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                rows.insert(hashes.value(i).to_vec(), names.value(i).to_string());
+            }
+        }
+
+        assert_eq!(
+            rows.len(),
+            3,
+            "deletion vector should leave newest-per-PK, got {:?}",
+            rows
+        );
+        assert_eq!(rows.get(key(1).as_slice()), Some(&"a2".to_string()));
+        assert_eq!(rows.get(key(2).as_slice()), Some(&"b".to_string()));
+        assert_eq!(rows.get(key(3).as_slice()), Some(&"c2".to_string()));
     }
 
     /// Flushing a memtable with a primary-key index writes a standalone sidecar

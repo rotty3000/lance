@@ -2474,4 +2474,23 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+    /// knowdb keys its content table on `content_hash: FixedSizeBinary(32)`.
+    /// The counterpart of `test_plan_vector_search_validates_pk_types`: the
+    /// validator must reject unhashable types without rejecting this one.
+    #[tokio::test]
+    async fn test_plan_dedup_scan_accepts_fixed_size_binary_pk() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("content_hash", DataType::FixedSizeBinary(32), false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let batch_store = Arc::new(BatchStore::with_capacity(4));
+        let indexes = Arc::new(IndexStore::new());
+
+        let scanner = MemTableScanner::new(batch_store, indexes, schema);
+
+        scanner
+            .create_dedup_plan(&["content_hash".to_string()])
+            .await
+            .expect("a FixedSizeBinary primary key must plan a dedup scan");
+    }
 }
