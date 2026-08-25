@@ -191,11 +191,18 @@ pub async fn compute_source_block_lists(
                 ..
             } => sstable_loads.push(async move {
                 let index = open_pk_index(path, session, store_params, sstable_cache).await?;
-                Ok::<_, Error>((*shard_id, *generation, GenMembership::OnDisk(index)))
+                // No sidecar: this generation can't be probed, so it blocks nothing.
+                Ok::<_, Error>(
+                    index.map(|index| (*shard_id, *generation, GenMembership::OnDisk(index))),
+                )
             }),
         }
     }
-    for (shard_id, generation, membership) in futures::future::try_join_all(sstable_loads).await? {
+    for (shard_id, generation, membership) in futures::future::try_join_all(sstable_loads)
+        .await?
+        .into_iter()
+        .flatten()
+    {
         by_shard
             .entry(shard_id)
             .or_default()
@@ -304,14 +311,15 @@ pub async fn fresh_tier_block_list(
                     sstable_loads.push(async move {
                         let index =
                             open_pk_index(path, session, store_params, sstable_cache).await?;
-                        Ok::<_, Error>((slot, GenMembership::OnDisk(index)))
+                        // No sidecar: leave the slot empty — it blocks nothing.
+                        Ok::<_, Error>((slot, index.map(GenMembership::OnDisk)))
                     });
                 }
             }
         }
     }
     for (slot, membership) in futures::future::try_join_all(sstable_loads).await? {
-        slots[slot] = Some(membership);
+        slots[slot] = membership;
     }
     Ok(slots
         .into_iter()
@@ -381,12 +389,36 @@ fn path_cache_uuid(path: &str) -> Uuid {
     Uuid::from_u128(((hi.finish() as u128) << 64) | lo.finish() as u128)
 }
 
+/// Returns `None` when the generation has no sidecar.
+///
+/// The sidecar is **optional by construction**: [`create_pk_index`] returns
+/// `Ok(())` without writing one whenever the generation has no primary-key
+/// index to train from — either no index store at all, or a store whose
+/// `pk_training_batches` come back empty — and its own doc records it as a
+/// "No-op without a primary-key index". Opening the path unconditionally
+/// therefore turned a documented writer no-op into a hard `NotFound` on every
+/// read, for any dataset that never declared a primary key.
+///
+/// Absence means the generation cannot be probed, so it blocks nothing —
+/// exactly the semantics [`in_memory_membership`] already documents for a
+/// memtable without a primary-key index. Only `NotFound` is absorbed; every
+/// other error still propagates, so a corrupt or unreadable sidecar is not
+/// silently downgraded into a missing one.
+///
+/// ⚠ Under-blocking is the one dangerous direction here — a generation that
+/// should have shadowed an older row but reports no membership lets a stale row
+/// survive the KNN. That is why absorbing `NotFound` has to be safe rather than
+/// merely convenient, and it is: `create_pk_index` runs *before* the generation
+/// is committed, so a failed sidecar write fails the flush and the generation
+/// never becomes visible. A visible generation therefore has either a complete
+/// sidecar or none at all — a half-written one is not a reachable state, so
+/// `NotFound` here cannot be a truncated index being mistaken for an absent one.
 async fn open_pk_index(
     path: &str,
     session: Option<&Arc<Session>>,
     store_params: Option<&ObjectStoreParams>,
     sstable_cache: Option<&Arc<dyn DatasetCache>>,
-) -> Result<Arc<dyn ScalarIndex>> {
+) -> Result<Option<Arc<dyn ScalarIndex>>> {
     let dataset = open_sstable(path, session, store_params, sstable_cache, None).await?;
     // Namespace the session index cache by the (immutable) SSTable path so this
     // sidecar's pages live alongside every other index instead of a bespoke
@@ -405,15 +437,17 @@ async fn open_pk_index(
         .get_from_cache(store.clone(), None, &index_cache)
         .await?
     {
-        return Ok(index);
+        return Ok(Some(index));
     }
     let details = prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
         .map_err(|e| Error::io(e.to_string()))?;
-    let index = plugin
-        .load_index(store, &details, None, &index_cache)
-        .await?;
+    let index = match plugin.load_index(store, &details, None, &index_cache).await {
+        Ok(index) => index,
+        Err(Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e),
+    };
     plugin.put_in_cache(&index_cache, index.clone()).await?;
-    Ok(index)
+    Ok(Some(index))
 }
 
 /// Write an SSTable's standalone PK sidecar at `{uri}/_pk_index` from
@@ -422,8 +456,11 @@ async fn open_pk_index(
 /// resolves columns by name). A no-op when no batch carries the PK columns.
 ///
 /// Used by Rust scanner tests and by the Python test-support binding to stage
-/// faithful SSTables (an SSTable dataset alone, with no sidecar, is
-/// not a state production ever produces).
+/// SSTables that *do* carry a sidecar. An SSTable dataset with no sidecar is
+/// also a production state, not merely a test artifact: [`create_pk_index`]
+/// writes nothing for a generation with no primary-key index to train from, so
+/// any dataset that never declared a primary key flushes exactly that shape.
+/// [`open_pk_index`] tolerates it.
 pub async fn write_pk_sidecar(
     uri: &str,
     batches: &[arrow_array::RecordBatch],
@@ -826,5 +863,58 @@ mod tests {
             .await
             .unwrap();
         assert!(blocks(&sets, 5).await);
+    }
+
+    /// A flushed generation with **no** PK sidecar must read as "blocks
+    /// nothing", not as an error.
+    ///
+    /// `create_pk_index` writes no sidecar when the generation has no
+    /// primary-key index to train from, and returns `Ok`. Both block-list
+    /// entry points used to open that path unconditionally, so every scan of a
+    /// dataset that never declared a primary key failed with `NotFound` on
+    /// `.../_pk_index/page_lookup.lance`. Covers both entry points, since each
+    /// opens the sidecar on its own call path.
+    #[tokio::test]
+    async fn a_generation_without_a_pk_sidecar_blocks_nothing_instead_of_erroring() {
+        use crate::dataset::{Dataset, WriteParams};
+        use arrow_array::RecordBatchIterator;
+
+        // Written exactly as above, but with NO `write_pk_sidecar` call — the
+        // shape a flush produces when the dataset declares no primary key.
+        let sstable_batch = id_batch(&[5]);
+        let schema = sstable_batch.schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = format!("{}/gen2", tmp.path().to_str().unwrap());
+        let reader = RecordBatchIterator::new(vec![Ok(sstable_batch.clone())], schema.clone());
+        Dataset::write(reader, &path, Some(WriteParams::default()))
+            .await
+            .unwrap();
+
+        let shard = Uuid::new_v4();
+        let sources = vec![LsmDataSource::SsTable {
+            path,
+            shard_id: shard,
+            generation: LsmGeneration::memtable(2),
+        }];
+
+        // Entry point 1: no membership is contributed, so nothing is blocked.
+        let sets = fresh_tier_block_list(&sources, None, None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            sets.is_empty(),
+            "a sidecar-less generation contributes no membership"
+        );
+        assert!(!blocks(&sets, 5).await);
+
+        // Entry point 2: the same source yields no blocked entries at all,
+        // rather than propagating NotFound.
+        let blocked = Box::pin(compute_source_block_lists(&sources, None, None, None))
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "a lone sidecar-less generation blocks nothing"
+        );
     }
 }
