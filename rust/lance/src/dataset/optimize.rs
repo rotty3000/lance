@@ -209,6 +209,11 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
+    /// Maximum number of source bytes (summed over source fragments' data files)
+    /// to compact in a single run. Tasks are included until adding the next would
+    /// exceed this limit; a single task that alone exceeds it is excluded (empty
+    /// plan). Defaults to `None` (no byte limit). Sibling of `max_source_fragments`.
+    pub max_source_bytes: Option<u64>,
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -236,6 +241,7 @@ impl Default for CompactionOptions {
             enable_binary_copy_force: false,
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
+            max_source_bytes: None,
             transaction_properties: None,
         }
     }
@@ -260,6 +266,7 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.max_source_bytes`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -353,6 +360,14 @@ impl CompactionOptions {
                 }
                 "max_source_fragments" => {
                     self.max_source_fragments = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "max_source_bytes" => {
+                    self.max_source_bytes = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -708,13 +723,23 @@ impl CompactionPlanner for DefaultCompactionPlanner {
             })
             .collect();
 
-        let tasks = if let Some(max_frags) = self.options.max_source_fragments {
-            let mut total_frags = 0;
+        let tasks = if self.options.max_source_fragments.is_some()
+            || self.options.max_source_bytes.is_some()
+        {
+            let mut total_frags = 0usize;
+            let mut total_bytes = 0u64;
             all_tasks
                 .into_iter()
                 .take_while(|task| {
                     total_frags += task.fragments.len();
-                    total_frags <= max_frags
+                    total_bytes = total_bytes.saturating_add(task_source_bytes(task));
+                    self.options
+                        .max_source_fragments
+                        .map_or(true, |m| total_frags <= m)
+                        && self
+                            .options
+                            .max_source_bytes
+                            .map_or(true, |m| total_bytes <= m)
                 })
                 .collect()
         } else {
@@ -924,6 +949,20 @@ async fn prepare_reader(
 pub struct TaskData {
     /// The fragments to compact.
     pub fragments: Vec<Fragment>,
+}
+
+/// Sum of on-disk data file sizes (bytes) for all fragments in a task.
+///
+/// A fragment whose `file_size_bytes` is unknown (e.g. legacy metadata
+/// written before this field existed) contributes `0` rather than failing
+/// the sum, matching the existing `.get().map_or(0, |v| v.get())` treatment
+/// of this same field in `lance-table`'s `DataFile` -> proto conversion.
+fn task_source_bytes(task: &TaskData) -> u64 {
+    task.fragments
+        .iter()
+        .flat_map(|f| f.files.iter())
+        .map(|df| df.file_size_bytes.get().map_or(0, |v| v.get()))
+        .sum()
 }
 
 /// A standalone task that can be serialized and sent to another machine for
@@ -4550,6 +4589,132 @@ mod tests {
         assert!(
             after_second <= after_first,
             "expected progress: {after_second} should be <= {after_first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_source_bytes() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let data = sample_data();
+        let schema = data.schema();
+
+        // Create 10 small fragments (100 rows each) via 10 appends
+        let write_params = WriteParams {
+            max_rows_per_file: 100,
+            ..Default::default()
+        };
+        Dataset::write(
+            RecordBatchIterator::new(vec![Ok(data.slice(0, 100))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        for i in 1..10 {
+            let mut append_params = write_params.clone();
+            append_params.mode = WriteMode::Append;
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(data.slice(i * 100, 100))], schema.clone()),
+                test_uri,
+                Some(append_params),
+            )
+            .await
+            .unwrap();
+        }
+
+        let dataset = Dataset::open(test_uri).await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 10);
+
+        // Plan without limit - all 10 fragments should be candidates. Use
+        // this plan to measure the per-fragment byte size (uniform, since
+        // every fragment holds the same shape and row count).
+        let opts_no_limit = CompactionOptions {
+            target_rows_per_fragment: 250,
+            ..Default::default()
+        };
+        let plan_all = plan_compaction(&dataset, &opts_no_limit).await.unwrap();
+        let total_source_frags: usize = plan_all.tasks().iter().map(|t| t.fragments.len()).sum();
+        assert_eq!(total_source_frags, 10);
+        assert!(
+            plan_all.num_tasks() > 2,
+            "need multiple tasks to test bounding, got {}",
+            plan_all.num_tasks()
+        );
+        let total_source_bytes: u64 = plan_all
+            .tasks()
+            .iter()
+            .flat_map(|t| t.fragments.iter())
+            .flat_map(|f| f.files.iter())
+            .map(|df| df.file_size_bytes.get().map_or(0, |v| v.get()))
+            .sum();
+        assert!(
+            total_source_bytes > 0,
+            "fragments should report nonzero file sizes"
+        );
+        let per_fragment_bytes = total_source_bytes / 10;
+
+        // Plan with a byte budget covering ~4 fragments' worth of bytes
+        // should include no more than that many source bytes.
+        let byte_limit = per_fragment_bytes * 4;
+        let opts_bounded = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(byte_limit),
+            ..Default::default()
+        };
+        let plan_bounded = plan_compaction(&dataset, &opts_bounded).await.unwrap();
+        let bounded_source_bytes: u64 = plan_bounded
+            .tasks()
+            .iter()
+            .flat_map(|t| t.fragments.iter())
+            .flat_map(|f| f.files.iter())
+            .map(|df| df.file_size_bytes.get().map_or(0, |v| v.get()))
+            .sum();
+        assert!(
+            bounded_source_bytes <= byte_limit,
+            "expected at most {byte_limit} source bytes, got {bounded_source_bytes}"
+        );
+        assert!(
+            bounded_source_bytes > 0,
+            "expected at least some source bytes in the bounded plan"
+        );
+        assert!(
+            plan_bounded.num_tasks() < plan_all.num_tasks(),
+            "bounded plan ({}) should have fewer tasks than unbounded ({})",
+            plan_bounded.num_tasks(),
+            plan_all.num_tasks()
+        );
+
+        // A single task whose source bytes alone exceed the limit yields an
+        // empty plan (no partial progress on a task that can't fit) - matches
+        // upstream's "single task exceeds budget -> no progress" semantics.
+        let opts_too_small = CompactionOptions {
+            target_rows_per_fragment: 250,
+            max_source_bytes: Some(per_fragment_bytes / 2),
+            ..Default::default()
+        };
+        let plan_empty = plan_compaction(&dataset, &opts_too_small).await.unwrap();
+        assert_eq!(
+            plan_empty.num_tasks(),
+            0,
+            "a lone over-budget task should yield an empty plan"
+        );
+
+        // Execute bounded compaction incrementally, mirroring
+        // test_max_source_fragments.
+        let mut dataset = dataset;
+        compact_files(&mut dataset, opts_bounded, None)
+            .await
+            .unwrap();
+        let after_first = dataset.get_fragments().len();
+        assert!(
+            after_first < 10,
+            "expected fewer than 10 fragments after first compaction, got {after_first}"
+        );
+        assert!(
+            after_first > 1,
+            "expected partial compaction (not fully compacted), got {after_first}"
         );
     }
 
