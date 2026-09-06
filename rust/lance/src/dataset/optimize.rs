@@ -651,6 +651,9 @@ impl CompactionPlanner for DefaultCompactionPlanner {
 
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
+            // Read the fragment's source bytes before it is moved into a bin, so
+            // the byte-aware split can bound a task by real bytes (#702).
+            let frag_bytes = fragment_source_bytes(&fragment);
 
             let candidacy = if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
@@ -676,6 +679,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                         pos_range: i..(i + 1),
                         candidacy: vec![candidacy],
                         row_counts: vec![metrics.num_rows()],
+                        byte_counts: vec![frag_bytes],
                         indices,
                     });
                 }
@@ -688,6 +692,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                         bin.pos_range.end += 1;
                         bin.candidacy.push(candidacy);
                         bin.row_counts.push(metrics.num_rows());
+                        bin.byte_counts.push(frag_bytes);
                     } else {
                         // Index set is different.  Complete previous bin and start new one
                         candidate_bins.push(current_bin.take().unwrap());
@@ -696,6 +701,7 @@ impl CompactionPlanner for DefaultCompactionPlanner {
                             pos_range: i..(i + 1),
                             candidacy: vec![candidacy],
                             row_counts: vec![metrics.num_rows()],
+                            byte_counts: vec![frag_bytes],
                             indices,
                         });
                     }
@@ -717,7 +723,21 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let all_tasks: Vec<TaskData> = candidate_bins
             .into_iter()
             .filter(|bin| !bin.is_noop())
-            .flat_map(|bin| bin.split_for_size(self.options.target_rows_per_fragment))
+            .flat_map(|bin| {
+                bin.split_for_size(
+                    self.options.target_rows_per_fragment,
+                    self.options.max_source_bytes,
+                )
+            })
+            // ⚠ #702: re-apply `is_noop` to the SPLIT output. `is_noop` was
+            // checked on the whole bin ABOVE, but byte-aware `split_for_size` can
+            // carve a bin into a sub-bin holding a single `CompactWithNeighbors`
+            // fragment (when the byte budget forces it to stand alone). Rewriting
+            // such a fragment 1->1 reduces no fragment count — pure wasted I/O,
+            // and it consumes pass budget that a reducing task then misses. A lone
+            // `CompactItself` sub-bin is NOT a no-op (it materializes deletions),
+            // so `is_noop` correctly keeps it.
+            .filter(|bin| !bin.is_noop())
             .map(|bin| TaskData {
                 fragments: bin.fragments,
             })
@@ -726,22 +746,50 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         let tasks = if self.options.max_source_fragments.is_some()
             || self.options.max_source_bytes.is_some()
         {
+            // Greedy prefix bounded by the per-pass budget. ⚠ #702: a task whose
+            // OWN source bytes exceed `max_source_bytes` can never fit a pass —
+            // SKIP it (a single fragment wider than the whole budget) rather than
+            // halting the plan on it. The old `take_while` stopped at the first
+            // over-budget task and dropped every task after it, so one such task
+            // at the front emptied the plan and compaction made no progress at
+            // all — starving a bimodal-row-width table (knowdb's atoms table:
+            // narrow unvectorized rows beside wide vectorized rows) under
+            // sustained ingestion. Byte-aware `split_for_size` (above) guarantees
+            // every MULTI-fragment task is already <= the budget, and the `is_noop`
+            // re-filter has dropped the lone-`CompactWithNeighbors` sub-bins, so
+            // this skip only ever fires on a lone `CompactItself` fragment wider
+            // than the budget.
             let mut total_frags = 0usize;
             let mut total_bytes = 0u64;
-            all_tasks
-                .into_iter()
-                .take_while(|task| {
-                    total_frags += task.fragments.len();
-                    total_bytes = total_bytes.saturating_add(task_source_bytes(task));
-                    self.options
-                        .max_source_fragments
-                        .map_or(true, |m| total_frags <= m)
-                        && self
-                            .options
-                            .max_source_bytes
-                            .map_or(true, |m| total_bytes <= m)
-                })
-                .collect()
+            let mut kept: Vec<TaskData> = Vec::with_capacity(all_tasks.len());
+            for task in all_tasks {
+                let task_bytes = task_source_bytes(&task);
+                if let Some(m) = self.options.max_source_bytes {
+                    if task_bytes > m {
+                        continue;
+                    }
+                }
+                let next_frags = total_frags + task.fragments.len();
+                let next_bytes = total_bytes.saturating_add(task_bytes);
+                let within_frags = self
+                    .options
+                    .max_source_fragments
+                    .map_or(true, |m| next_frags <= m);
+                let within_bytes = self
+                    .options
+                    .max_source_bytes
+                    .map_or(true, |m| next_bytes <= m);
+                if within_frags && within_bytes {
+                    total_frags = next_frags;
+                    total_bytes = next_bytes;
+                    kept.push(task);
+                } else {
+                    // This pass's budget is spent; remaining tasks wait for the
+                    // next scheduled pass (preserves the bounded-pass guarantee).
+                    break;
+                }
+            }
+            kept
         } else {
             all_tasks
         };
@@ -958,9 +1006,16 @@ pub struct TaskData {
 /// the sum, matching the existing `.get().map_or(0, |v| v.get())` treatment
 /// of this same field in `lance-table`'s `DataFile` -> proto conversion.
 fn task_source_bytes(task: &TaskData) -> u64 {
-    task.fragments
+    task.fragments.iter().map(fragment_source_bytes).sum()
+}
+
+/// Source bytes of one fragment, summed from its `DataFile.file_size_bytes`.
+/// An unrecorded size counts as 0 (the accepted "unmeasurable → over-drains"
+/// residual, same as [`task_source_bytes`]).
+fn fragment_source_bytes(fragment: &Fragment) -> u64 {
+    fragment
+        .files
         .iter()
-        .flat_map(|f| f.files.iter())
         .map(|df| df.file_size_bytes.get().map_or(0, |v| v.get()))
         .sum()
 }
@@ -1025,6 +1080,13 @@ struct CandidateBin {
     pub pos_range: Range<usize>,
     pub candidacy: Vec<CompactionCandidacy>,
     pub row_counts: Vec<usize>,
+    /// Per-fragment source bytes (parallel to `row_counts`), summed from each
+    /// fragment's `DataFile.file_size_bytes`. Drives the byte-aware split so a
+    /// task never exceeds `max_source_bytes` on a table whose rows are wider
+    /// than `target_rows_per_fragment` assumes (#702). An unmeasurable fragment
+    /// (no cached size) contributes 0, so a byte budget is inert for it — the
+    /// same "over-drains for size-0 fragments" residual as `task_source_bytes`.
+    pub byte_counts: Vec<u64>,
     pub indices: Vec<usize>,
 }
 
@@ -1042,32 +1104,77 @@ impl CandidateBin {
         }
     }
 
-    /// Split into one or more bins with at least `min_num_rows` in them.
-    fn split_for_size(mut self, min_num_rows: usize) -> Vec<Self> {
+    /// Split into one or more bins, each holding at least `min_num_rows` rows —
+    /// UNLESS `max_source_bytes` is reached first, in which case the bin is
+    /// closed early so no task can exceed the per-pass byte budget (#702).
+    ///
+    /// With `max_source_bytes = None` this is the original pure row-count split.
+    /// With a byte budget, a bin stops before a fragment that would push its
+    /// source bytes over the budget; a single fragment whose own bytes already
+    /// exceed the budget still forms its own bin (the planner's byte filter then
+    /// skips that task — the "fragment wider than the budget" residual). The
+    /// sub-`min_num_rows` remainder is folded into the last bin as before, but
+    /// only when doing so keeps that bin within the budget.
+    fn split_for_size(mut self, min_num_rows: usize, max_source_bytes: Option<u64>) -> Vec<Self> {
+        // Defense-in-depth: `min_num_rows == 0` would make the inner `while` add
+        // nothing, so the loop could push empty bins forever. knowdb never passes
+        // 0 (its `target_rows_per_fragment` is floored to >= 1), but this is a
+        // public lance API, so clamp rather than trust the caller.
+        let min_num_rows = min_num_rows.max(1);
         let mut bins = Vec::new();
 
         loop {
             let mut bin_len = 0;
             let mut bin_row_count = 0;
+            let mut bin_bytes = 0u64;
             while bin_row_count < min_num_rows && bin_len < self.row_counts.len() {
+                // Byte ceiling: don't add a fragment that would push an already
+                // non-empty bin over the pass budget (always keep >= 1 fragment).
+                if let Some(cap) = max_source_bytes {
+                    if bin_len > 0 && bin_bytes.saturating_add(self.byte_counts[bin_len]) > cap {
+                        break;
+                    }
+                }
                 bin_row_count += self.row_counts[bin_len];
+                bin_bytes = bin_bytes.saturating_add(self.byte_counts[bin_len]);
                 bin_len += 1;
             }
 
-            // If there's enough remaining to make another worthwhile bin, then
-            // push what we have as a bin.
-            if self.row_counts[bin_len..].iter().sum::<usize>() >= min_num_rows {
+            // This bin consumed everything remaining — it is the last bin. Push
+            // it and stop, so the loop never iterates with an emptied `self`
+            // (which would push a zero-fragment bin that the byte filter then
+            // keeps as a bogus 1-task plan). Mirrors the original's terminating
+            // `else` arm.
+            if bin_len == self.row_counts.len() {
+                bins.push(self);
+                break;
+            }
+
+            // Fold a sub-`min_num_rows` remainder into this bin instead of making
+            // a tiny trailing bin — but only when the remainder ALSO fits under
+            // the byte budget alongside what we have; otherwise splitting it off
+            // is exactly what keeps every task within budget.
+            let rows_remaining: usize = self.row_counts[bin_len..].iter().sum();
+            let bytes_remaining: u64 = self.byte_counts[bin_len..].iter().copied().sum();
+            let remainder_fits_cap = max_source_bytes
+                .map_or(true, |cap| bin_bytes.saturating_add(bytes_remaining) <= cap);
+
+            if rows_remaining >= min_num_rows || !remainder_fits_cap {
+                // Enough left for another bin (rows), or folding would break the
+                // budget: close this bin and keep splitting the remainder.
                 bins.push(Self {
                     fragments: self.fragments.drain(0..bin_len).collect(),
                     pos_range: self.pos_range.start..(self.pos_range.start + bin_len),
                     candidacy: self.candidacy.drain(0..bin_len).collect(),
                     row_counts: self.row_counts.drain(0..bin_len).collect(),
+                    byte_counts: self.byte_counts.drain(0..bin_len).collect(),
                     // By the time we are splitting for size we are done considering indices
                     indices: Vec::new(),
                 });
                 self.pos_range.start += bin_len;
             } else {
-                // Otherwise, just push the remaining fragments into the last bin
+                // Small remainder that fits the budget: push the remaining
+                // fragments as the last bin.
                 bins.push(self);
                 break;
             }
@@ -1711,18 +1818,11 @@ mod tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
-    #[test]
-    fn test_candidate_bin() {
-        let empty_bin = CandidateBin {
-            fragments: vec![],
-            pos_range: 0..0,
-            candidacy: vec![],
-            row_counts: vec![],
-            indices: vec![],
-        };
-        assert!(empty_bin.is_noop());
-
-        let fragment = Fragment {
+    /// A bare `Fragment` for planner unit tests — metadata only (no data files,
+    /// so its `file_size_bytes` is unknown); tests drive `row_counts`/`byte_counts`
+    /// on the `CandidateBin` directly.
+    fn bare_fragment() -> Fragment {
+        Fragment {
             id: 0,
             files: vec![],
             deletion_file: None,
@@ -1730,12 +1830,28 @@ mod tests {
             physical_rows: Some(0),
             last_updated_at_version_meta: None,
             created_at_version_meta: None,
+        }
+    }
+
+    #[test]
+    fn test_candidate_bin() {
+        let empty_bin = CandidateBin {
+            fragments: vec![],
+            pos_range: 0..0,
+            candidacy: vec![],
+            row_counts: vec![],
+            byte_counts: vec![],
+            indices: vec![],
         };
+        assert!(empty_bin.is_noop());
+
+        let fragment = bare_fragment();
         let single_bin = CandidateBin {
             fragments: vec![fragment.clone()],
             pos_range: 0..1,
             candidacy: vec![CompactionCandidacy::CompactWithNeighbors],
             row_counts: vec![100],
+            byte_counts: vec![0],
             indices: vec![],
         };
         assert!(single_bin.is_noop());
@@ -1745,6 +1861,7 @@ mod tests {
             pos_range: 0..1,
             candidacy: vec![CompactionCandidacy::CompactItself],
             row_counts: vec![100],
+            byte_counts: vec![0],
             indices: vec![],
         };
         // Not a no-op because it's CompactItself
@@ -1755,16 +1872,153 @@ mod tests {
             pos_range: 0..8,
             candidacy: std::iter::repeat_n(CompactionCandidacy::CompactItself, 8).collect(),
             row_counts: vec![100, 400, 200, 200, 400, 300, 300, 100],
+            byte_counts: vec![0; 8],
             indices: vec![],
             // Will group into: [[100, 400], [200, 200, 400], [300, 300, 100]]
             // with size = 500
         };
         assert!(!big_bin.is_noop());
-        let split = big_bin.split_for_size(500);
+        // No byte budget: pure row-count split, unchanged from the original.
+        let split = big_bin.split_for_size(500, None);
         assert_eq!(split.len(), 3);
         assert_eq!(split[0].pos_range, 0..2);
         assert_eq!(split[1].pos_range, 2..5);
         assert_eq!(split[2].pos_range, 5..8);
+    }
+
+    /// #702: `split_for_size` must bound a bin by BYTES when a byte budget is
+    /// in force, so a table with bimodal row widths (e.g. atoms: unvectorized
+    /// ~1 KB rows vs fully-vectorized ~11 KB rows) cannot produce a task whose
+    /// source bytes exceed the pass budget. Without this, a `target_rows`-sized
+    /// task drawn from the wide side blows the budget and the planner's byte
+    /// filter drops it (and every task after it), emptying the plan — compaction
+    /// makes no progress forever.
+    #[test]
+    fn split_for_size_bounds_a_bin_by_bytes() {
+        let fragment = bare_fragment();
+        // Six 100-row fragments. The first three are WIDE (30_000 B each), the
+        // last three NARROW (1_000 B each). `min_num_rows = 600` (a target-row
+        // count derived from the narrow median) would pack ALL SIX into one bin.
+        let make = || CandidateBin {
+            fragments: std::iter::repeat_n(fragment.clone(), 6).collect(),
+            pos_range: 0..6,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactWithNeighbors, 6).collect(),
+            row_counts: vec![100; 6],
+            byte_counts: vec![30_000, 30_000, 30_000, 1_000, 1_000, 1_000],
+            indices: vec![],
+        };
+
+        // Row-only (no budget): one over-budget bin of all six fragments —
+        // 93_000 B, far beyond a 50_000 B pass budget. This is the #702 stall.
+        let row_only = make().split_for_size(600, None);
+        assert_eq!(
+            row_only.len(),
+            1,
+            "row-only split packs everything into one bin"
+        );
+        let row_only_bytes: u64 = row_only[0].byte_counts.iter().sum();
+        assert_eq!(row_only_bytes, 93_000);
+
+        // Byte-aware with a 50_000 B budget: NO multi-fragment bin may exceed it.
+        let cap = 50_000u64;
+        let byte_aware = make().split_for_size(600, Some(cap));
+        assert!(
+            byte_aware.len() > 1,
+            "a byte budget must split the over-budget bin (got {} bins)",
+            byte_aware.len()
+        );
+        for bin in &byte_aware {
+            let bytes: u64 = bin.byte_counts.iter().sum();
+            assert!(
+                bytes <= cap || bin.fragments.len() == 1,
+                "multi-fragment bin of {bytes} B exceeds the {cap} B budget"
+            );
+            assert_eq!(
+                bin.fragments.len(),
+                bin.byte_counts.len(),
+                "byte_counts must stay parallel to fragments after a split"
+            );
+        }
+        // Every fragment is preserved exactly once across the split.
+        let total: usize = byte_aware.iter().map(|b| b.fragments.len()).sum();
+        assert_eq!(total, 6);
+    }
+
+    /// A single fragment whose own bytes exceed the budget still forms its own
+    /// bin (it cannot be split further) — the planner's byte filter is what
+    /// skips such a task; `split_for_size` must not lose the fragment.
+    #[test]
+    fn split_for_size_keeps_a_lone_oversize_fragment_as_its_own_bin() {
+        let fragment = bare_fragment();
+        // narrow, WIDE-over-budget, narrow.
+        let bin = CandidateBin {
+            fragments: std::iter::repeat_n(fragment, 3).collect(),
+            pos_range: 0..3,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactWithNeighbors, 3).collect(),
+            row_counts: vec![100, 100, 100],
+            byte_counts: vec![1_000, 999_999, 1_000],
+            indices: vec![],
+        };
+        let split = bin.split_for_size(600, Some(50_000));
+        let total: usize = split.iter().map(|b| b.fragments.len()).sum();
+        assert_eq!(total, 3, "no fragment may be dropped");
+        // The oversize fragment sits alone in some bin.
+        assert!(
+            split
+                .iter()
+                .any(|b| b.fragments.len() == 1 && b.byte_counts == vec![999_999]),
+            "the over-budget fragment must be isolated in its own bin"
+        );
+    }
+
+    /// #702 (perf): the byte budget can isolate a lone `CompactWithNeighbors`
+    /// fragment that is UNDER the budget but cannot pair with a neighbor within
+    /// it. Such a sub-bin is a no-op — rewriting it 1->1 reduces nothing — so the
+    /// planner re-applies `is_noop` to the split output to drop it. This pins that
+    /// the split produces exactly such droppable sub-bins (and keeps a lone
+    /// `CompactItself` one, which materializes deletions and is not a no-op).
+    #[test]
+    fn split_isolates_a_lone_under_budget_fragment_that_the_planner_drops() {
+        let fragment = bare_fragment();
+        // Three 100-row fragments, each 200_000 B — each under the 256_000 B
+        // budget, but any TWO (400_000 B) exceed it, so the byte ceiling isolates
+        // every one into its own bin.
+        let with_neighbors = CandidateBin {
+            fragments: std::iter::repeat_n(fragment.clone(), 3).collect(),
+            pos_range: 0..3,
+            candidacy: std::iter::repeat_n(CompactionCandidacy::CompactWithNeighbors, 3).collect(),
+            row_counts: vec![100, 100, 100],
+            byte_counts: vec![200_000, 200_000, 200_000],
+            indices: vec![],
+        };
+        let split = with_neighbors.split_for_size(600, Some(256_000));
+        assert!(
+            split.iter().all(|b| b.fragments.len() == 1),
+            "each under-budget-but-unpairable fragment isolates into its own bin"
+        );
+        // Every isolated `CompactWithNeighbors` sub-bin is a no-op → the planner's
+        // post-split `!is_noop` filter drops it (no pointless 1->1 rewrite).
+        assert!(
+            split.iter().all(|b| b.is_noop()),
+            "a lone CompactWithNeighbors sub-bin must read as a no-op so the planner drops it"
+        );
+
+        // A lone `CompactItself` fragment is NOT a no-op (it materializes
+        // deletions), so the same isolation must keep it.
+        let compact_itself = CandidateBin {
+            fragments: vec![fragment],
+            pos_range: 0..1,
+            candidacy: vec![CompactionCandidacy::CompactItself],
+            row_counts: vec![100],
+            byte_counts: vec![200_000],
+            indices: vec![],
+        };
+        let split = compact_itself.split_for_size(600, Some(256_000));
+        assert_eq!(split.len(), 1);
+        assert!(
+            !split[0].is_noop(),
+            "a lone CompactItself sub-bin is not a no-op — the planner must keep it"
+        );
     }
 
     fn sample_data() -> RecordBatch {
