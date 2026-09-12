@@ -377,17 +377,35 @@ impl OperationThrottle {
     /// token count and fill `rate`: `-tokens / rate`, but zero when a token was
     /// available (`tokens >= 0`) or the rate is non-positive, and never longer
     /// than `max_acquire_sleep`. Split out from [`Self::acquire_token`] so the
-    /// cap is unit-testable without a real clock or bucket. Callers are
+    /// behavior is unit-testable without a real clock or bucket. Callers are
     /// expected to have already floored `tokens` at `-max_queue_depth`.
+    ///
+    /// `jitter` is a caller-supplied value in `[0, 1)` used ONLY in the capped
+    /// region. Below the cap the deficit-proportional wait already staggers
+    /// waiters (each reserves a distinct token), so it is returned exactly.
+    /// Above the cap — where, without this, every waiter deeper than
+    /// `cap * rate` tokens would clamp to the SAME `max_acquire_sleep` and wake
+    /// simultaneously (the thundering herd the eager reservation exists to
+    /// avoid, re-introduced by a naive cap) — the wait is spread across
+    /// `[cap/2, cap]` by `jitter`, so capped waiters stay desynchronized and
+    /// don't burst the object store on one instant.
     fn planned_sleep(
         tokens: f64,
         rate: f64,
         max_acquire_sleep: std::time::Duration,
+        jitter: f64,
     ) -> std::time::Duration {
         if tokens >= 0.0 || rate <= 0.0 {
             return std::time::Duration::ZERO;
         }
-        std::time::Duration::from_secs_f64(-tokens / rate).min(max_acquire_sleep)
+        let raw = -tokens / rate;
+        let cap = max_acquire_sleep.as_secs_f64();
+        if raw <= cap {
+            std::time::Duration::from_secs_f64(raw)
+        } else {
+            let frac = 0.5 + 0.5 * jitter.clamp(0.0, 1.0);
+            std::time::Duration::from_secs_f64(cap * frac)
+        }
     }
 
     /// Acquire a token from the bucket, sleeping if none are available.
@@ -417,7 +435,10 @@ impl OperationThrottle {
                 return;
             }
 
-            Self::planned_sleep(bucket.tokens, bucket.rate, self.max_acquire_sleep)
+            // Jitter (in [0, 1)) desynchronizes waiters that clamp to the cap;
+            // below the cap it is unused and the wait stays deficit-exact.
+            let jitter = rand::rng().random::<f64>();
+            Self::planned_sleep(bucket.tokens, bucket.rate, self.max_acquire_sleep, jitter)
         };
 
         tokio::time::sleep(sleep_duration).await;
@@ -820,25 +841,45 @@ mod tests {
         let cap = Duration::from_secs(10);
 
         // A deep token deficit at the AIMD floor rate (1 req/s) would, uncapped,
-        // sleep for the full deficit in seconds (e.g. 5000s). It must be capped.
-        let capped = OperationThrottle::planned_sleep(-5000.0, 1.0, cap);
+        // sleep for the full deficit in seconds (e.g. 5000s). It must be capped;
+        // with jitter=1.0 the capped value is exactly the cap (frac = 1.0).
+        let capped = OperationThrottle::planned_sleep(-5000.0, 1.0, cap, 1.0);
         assert_eq!(capped, cap, "a deep deficit must be capped at max_acquire_sleep");
 
-        // A small deficit whose proportional wait is under the cap is left alone.
-        let small = OperationThrottle::planned_sleep(-2.0, 1.0, cap);
+        // A small deficit whose proportional wait is under the cap is left alone,
+        // regardless of jitter (jitter only applies in the capped region).
+        let small = OperationThrottle::planned_sleep(-2.0, 1.0, cap, 0.0);
         assert_eq!(small, Duration::from_secs(2), "a sub-cap wait is not clamped");
+        let small_j = OperationThrottle::planned_sleep(-2.0, 1.0, cap, 0.9);
+        assert_eq!(small_j, Duration::from_secs(2), "sub-cap wait ignores jitter");
 
         // A token was available (>= 0) -> no sleep.
         assert_eq!(
-            OperationThrottle::planned_sleep(0.5, 1.0, cap),
+            OperationThrottle::planned_sleep(0.5, 1.0, cap, 0.5),
             Duration::ZERO
         );
 
         // A non-positive rate must not divide-by-zero into an unbounded sleep.
         assert_eq!(
-            OperationThrottle::planned_sleep(-100.0, 0.0, cap),
+            OperationThrottle::planned_sleep(-100.0, 0.0, cap, 0.5),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn planned_sleep_jitters_the_capped_region_to_avoid_a_thundering_herd() {
+        use std::time::Duration;
+        let cap = Duration::from_secs(10);
+        // Two deeply-queued waiters (both past the cap threshold) with different
+        // jitter must NOT get the same sleep — that is the desync that prevents
+        // them firing at the object store on the same instant.
+        let a = OperationThrottle::planned_sleep(-5000.0, 1.0, cap, 0.0);
+        let b = OperationThrottle::planned_sleep(-5000.0, 1.0, cap, 1.0);
+        assert_ne!(a, b, "capped waiters with different jitter must not synchronize");
+        // Jitter spreads the capped wait over [cap/2, cap].
+        assert_eq!(a, Duration::from_secs(5), "jitter=0.0 -> cap/2");
+        assert_eq!(b, cap, "jitter=1.0 -> cap");
+        assert!(a >= cap / 2 && a <= cap && b >= cap / 2 && b <= cap);
     }
 
     #[test]
