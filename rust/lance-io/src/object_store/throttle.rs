@@ -93,6 +93,20 @@ pub struct AimdThrottleConfig {
     pub min_backoff_ms: u64,
     /// Maximum backoff in milliseconds between retry attempts.
     pub max_backoff_ms: u64,
+    /// Upper bound, in seconds, on how long a single `acquire_token` call may
+    /// sleep. Without it the token-bucket wait is `-tokens / rate`, which is
+    /// UNBOUNDED: under sustained throttling the AIMD `rate` collapses toward
+    /// `min_rate` while `tokens` goes arbitrarily negative, so a single caller
+    /// can sleep for minutes-to-hours (observed: a 93-minute stall on a whole-
+    /// table compaction against GCS). Capping the per-call sleep keeps the
+    /// AIMD *rate* reduction as the real throttle while ensuring no individual
+    /// I/O wait can hang indefinitely.
+    pub max_acquire_sleep_secs: f64,
+    /// Floor on how negative the token deficit may go (i.e. the maximum queue
+    /// depth the bucket will account for). Bounds `-tokens / rate` from the
+    /// numerator side so the accounting cannot run away under a large burst of
+    /// concurrent waiters, complementing `max_acquire_sleep_secs`.
+    pub max_queue_depth: f64,
 }
 
 impl Default for AimdThrottleConfig {
@@ -107,6 +121,8 @@ impl Default for AimdThrottleConfig {
             max_retries: 3,
             min_backoff_ms: 100,
             max_backoff_ms: 300,
+            max_acquire_sleep_secs: 10.0,
+            max_queue_depth: 10_000.0,
         }
     }
 }
@@ -178,6 +194,8 @@ impl AimdThrottleConfig {
     /// | Max retries          | `lance_aimd_max_retries`         | `LANCE_AIMD_MAX_RETRIES`         | 3       |
     /// | Min backoff ms       | `lance_aimd_min_backoff_ms`      | `LANCE_AIMD_MIN_BACKOFF_MS`      | 100     |
     /// | Max backoff ms       | `lance_aimd_max_backoff_ms`      | `LANCE_AIMD_MAX_BACKOFF_MS`      | 300     |
+    /// | Max acquire sleep s  | `lance_aimd_max_acquire_sleep_secs` | `LANCE_AIMD_MAX_ACQUIRE_SLEEP_SECS` | 10  |
+    /// | Max queue depth      | `lance_aimd_max_queue_depth`     | `LANCE_AIMD_MAX_QUEUE_DEPTH`     | 10000   |
     pub fn from_storage_options(
         storage_options: Option<&HashMap<String, String>>,
     ) -> lance_core::Result<Self> {
@@ -283,6 +301,9 @@ impl AimdThrottleConfig {
         let max_retries = resolve_usize("lance_aimd_max_retries", storage_options, 3)?;
         let min_backoff_ms = resolve_u64("lance_aimd_min_backoff_ms", storage_options, 100)?;
         let max_backoff_ms = resolve_u64("lance_aimd_max_backoff_ms", storage_options, 300)?;
+        let max_acquire_sleep_secs =
+            resolve_f64("lance_aimd_max_acquire_sleep_secs", storage_options, 10.0)?;
+        let max_queue_depth = resolve_f64("lance_aimd_max_queue_depth", storage_options, 10_000.0)?;
 
         let aimd = AimdConfig::default()
             .with_initial_rate(initial_rate)
@@ -295,6 +316,8 @@ impl AimdThrottleConfig {
             max_retries,
             min_backoff_ms,
             max_backoff_ms,
+            max_acquire_sleep_secs,
+            max_queue_depth,
             ..Self::default()
                 .with_aimd(aimd)
                 .with_burst_capacity(burst_capacity)
@@ -316,6 +339,10 @@ struct OperationThrottle {
     max_retries: usize,
     min_backoff_ms: u64,
     max_backoff_ms: u64,
+    /// Cap on a single `acquire_token` sleep (see `AimdThrottleConfig::max_acquire_sleep_secs`).
+    max_acquire_sleep: std::time::Duration,
+    /// Floor on the token deficit (see `AimdThrottleConfig::max_queue_depth`).
+    max_queue_depth: f64,
 }
 
 impl OperationThrottle {
@@ -325,6 +352,8 @@ impl OperationThrottle {
         max_retries: usize,
         min_backoff_ms: u64,
         max_backoff_ms: u64,
+        max_acquire_sleep: std::time::Duration,
+        max_queue_depth: f64,
     ) -> lance_core::Result<Self> {
         let initial_rate = aimd_config.initial_rate;
         let controller = AimdController::new(aimd_config)?;
@@ -339,14 +368,36 @@ impl OperationThrottle {
             max_retries,
             min_backoff_ms,
             max_backoff_ms,
+            max_acquire_sleep,
+            max_queue_depth,
         })
+    }
+
+    /// Pure computation of the queue-wait sleep from a (possibly negative)
+    /// token count and fill `rate`: `-tokens / rate`, but zero when a token was
+    /// available (`tokens >= 0`) or the rate is non-positive, and never longer
+    /// than `max_acquire_sleep`. Split out from [`Self::acquire_token`] so the
+    /// cap is unit-testable without a real clock or bucket. Callers are
+    /// expected to have already floored `tokens` at `-max_queue_depth`.
+    fn planned_sleep(
+        tokens: f64,
+        rate: f64,
+        max_acquire_sleep: std::time::Duration,
+    ) -> std::time::Duration {
+        if tokens >= 0.0 || rate <= 0.0 {
+            return std::time::Duration::ZERO;
+        }
+        std::time::Duration::from_secs_f64(-tokens / rate).min(max_acquire_sleep)
     }
 
     /// Acquire a token from the bucket, sleeping if none are available.
     ///
     /// Each caller reserves a token immediately (allowing `tokens` to go
     /// negative) so that concurrent waiters queue behind each other instead
-    /// of all waking at the same instant (thundering herd).
+    /// of all waking at the same instant (thundering herd). The deficit is
+    /// floored at `-max_queue_depth` and the resulting sleep is capped at
+    /// `max_acquire_sleep`, so a single wait can never hang indefinitely under
+    /// sustained throttling (the AIMD rate reduction stays the real throttle).
     async fn acquire_token(&self) {
         let sleep_duration = {
             let mut bucket = self.bucket.lock().await;
@@ -357,14 +408,16 @@ impl OperationThrottle {
 
             // Reserve a token (may go negative to queue behind other waiters)
             bucket.tokens -= 1.0;
+            // Floor the deficit so a large concurrent burst can't drive the
+            // wait unbounded (complements the per-call sleep cap below).
+            bucket.tokens = bucket.tokens.max(-self.max_queue_depth);
 
             if bucket.tokens >= 0.0 {
                 // Had a token available, no need to sleep
                 return;
             }
 
-            // Sleep proportional to our position in the queue
-            std::time::Duration::from_secs_f64(-bucket.tokens / bucket.rate)
+            Self::planned_sleep(bucket.tokens, bucket.rate, self.max_acquire_sleep)
         };
 
         tokio::time::sleep(sleep_duration).await;
@@ -600,6 +653,8 @@ impl AimdThrottledStore {
         let max_retries = config.max_retries;
         let min_backoff_ms = config.min_backoff_ms;
         let max_backoff_ms = config.max_backoff_ms;
+        let max_acquire_sleep = std::time::Duration::from_secs_f64(config.max_acquire_sleep_secs);
+        let max_queue_depth = config.max_queue_depth;
         Ok(Self {
             target,
             read: Arc::new(OperationThrottle::new(
@@ -608,6 +663,8 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                max_acquire_sleep,
+                max_queue_depth,
             )?),
             write: Arc::new(OperationThrottle::new(
                 config.write,
@@ -615,6 +672,8 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                max_acquire_sleep,
+                max_queue_depth,
             )?),
             delete: Arc::new(OperationThrottle::new(
                 config.delete,
@@ -622,6 +681,8 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                max_acquire_sleep,
+                max_queue_depth,
             )?),
             list: Arc::new(OperationThrottle::new(
                 config.list,
@@ -629,6 +690,8 @@ impl AimdThrottledStore {
                 max_retries,
                 min_backoff_ms,
                 max_backoff_ms,
+                max_acquire_sleep,
+                max_queue_depth,
             )?),
         })
     }
@@ -749,6 +812,47 @@ mod tests {
             store: "test",
             source: msg.into(),
         }
+    }
+
+    #[test]
+    fn planned_sleep_is_capped_and_bounded() {
+        use std::time::Duration;
+        let cap = Duration::from_secs(10);
+
+        // A deep token deficit at the AIMD floor rate (1 req/s) would, uncapped,
+        // sleep for the full deficit in seconds (e.g. 5000s). It must be capped.
+        let capped = OperationThrottle::planned_sleep(-5000.0, 1.0, cap);
+        assert_eq!(capped, cap, "a deep deficit must be capped at max_acquire_sleep");
+
+        // A small deficit whose proportional wait is under the cap is left alone.
+        let small = OperationThrottle::planned_sleep(-2.0, 1.0, cap);
+        assert_eq!(small, Duration::from_secs(2), "a sub-cap wait is not clamped");
+
+        // A token was available (>= 0) -> no sleep.
+        assert_eq!(
+            OperationThrottle::planned_sleep(0.5, 1.0, cap),
+            Duration::ZERO
+        );
+
+        // A non-positive rate must not divide-by-zero into an unbounded sleep.
+        assert_eq!(
+            OperationThrottle::planned_sleep(-100.0, 0.0, cap),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn from_storage_options_resolves_the_acquire_sleep_cap() {
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("lance_aimd_max_acquire_sleep_secs".to_string(), "3".to_string());
+        opts.insert("lance_aimd_max_queue_depth".to_string(), "500".to_string());
+        let cfg = AimdThrottleConfig::from_storage_options(Some(&opts)).unwrap();
+        assert_eq!(cfg.max_acquire_sleep_secs, 3.0);
+        assert_eq!(cfg.max_queue_depth, 500.0);
+        // Defaults when unset.
+        let def = AimdThrottleConfig::from_storage_options(None).unwrap();
+        assert_eq!(def.max_acquire_sleep_secs, 10.0);
+        assert_eq!(def.max_queue_depth, 10_000.0);
     }
 
     #[rstest]
