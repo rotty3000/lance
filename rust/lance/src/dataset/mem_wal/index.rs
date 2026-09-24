@@ -253,7 +253,12 @@ pub fn validate_index_configs(
 }
 
 /// Types `pk_key::encode_value` can encode into an order-preserving composite key.
-fn is_encodable_pk_type(data_type: &DataType) -> bool {
+///
+/// FORK PATCH (knowdb): `pub(crate)` so `mem_wal::scanner::exec::pk`'s invariant test
+/// can assert `is_encodable_pk_type` ⊆ `is_supported_pk_type` directly, rather than
+/// against a hand-copied list. Drop the visibility widening if upstream accepts the
+/// allow-list sync.
+pub(crate) fn is_encodable_pk_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
         DataType::Int8
