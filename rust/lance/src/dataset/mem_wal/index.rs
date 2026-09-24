@@ -43,6 +43,11 @@ pub use fts::{FtsEntry, FtsMemIndex, FtsMemIndexPlugin, FtsParams, FtsQueryExpr,
 pub(crate) use fts::{QueryLocalFtsIndex, QueryLocalFtsStats, search_cross_column};
 pub use hnsw::{HnswMemIndex, HnswMemIndexPlugin, HnswParams};
 pub use pk_key::encode_pk_tuple;
+/// FORK PATCH (knowdb): re-exported `pub(crate)` so `mem_wal::scanner::exec::pk`'s
+/// invariant test can assert `is_encodable_pk_type` ⊆ `is_supported_pk_type` directly,
+/// rather than against a hand-copied list. Drop with the allow-list sync patch.
+#[cfg(test)]
+pub(crate) use pk_key::is_encodable as is_encodable_pk_type;
 pub use plugin::{
     FlushContext, FlushOutcome, GenerationWrite, MemIndex, MemIndexBuildContext, MemIndexParams,
     MemIndexPlugin, MemIndexRegistry, MemIndexSpec, PrimaryKeyIndex, ResolveContext, ResolvedIndex,
