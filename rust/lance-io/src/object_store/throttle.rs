@@ -114,6 +114,12 @@ pub struct AimdThrottleConfig {
     pub min_backoff_ms: u64,
     /// Maximum backoff in milliseconds between retry attempts.
     pub max_backoff_ms: u64,
+    /// FORK PATCH (knowdb) — not in upstream lance v12, whose `acquire_token`
+    /// still sleeps the unbounded `-tokens / rate`. The unbounded wait is an
+    /// upstream defect (candidate to file); delete this cap/floor + jitter if
+    /// upstream bounds the acquire sleep. See also the fork's `optimize.rs`
+    /// `max_source_bytes_per_task` patch (tracked as mmstore#763).
+    ///
     /// Upper bound, in seconds, on how long a single `acquire_token` call may
     /// sleep. Without it the token-bucket wait is `-tokens / rate`, which is
     /// UNBOUNDED: under sustained throttling the AIMD `rate` collapses toward
@@ -325,6 +331,21 @@ impl AimdThrottleConfig {
         let max_acquire_sleep_secs =
             resolve_f64("lance_aimd_max_acquire_sleep_secs", storage_options, 10.0)?;
         let max_queue_depth = resolve_f64("lance_aimd_max_queue_depth", storage_options, 10_000.0)?;
+        // Reject a misconfigured cap/floor at the boundary rather than panicking
+        // deep in `acquire_token`: a negative or non-finite `max_acquire_sleep_secs`
+        // makes `Duration::from_secs_f64` panic, and a non-positive value would
+        // disable the wait entirely. Mirrors the `> 0` validation on the
+        // compaction source-budget knobs.
+        for (key, value) in [
+            ("lance_aimd_max_acquire_sleep_secs", max_acquire_sleep_secs),
+            ("lance_aimd_max_queue_depth", max_queue_depth),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "Invalid value for '{key}': {value} (expected a finite value greater than 0)"
+                )));
+            }
+        }
 
         let aimd = AimdConfig::default()
             .with_initial_rate(initial_rate)
@@ -1230,6 +1251,24 @@ mod tests {
         let def = AimdThrottleConfig::from_storage_options(None).unwrap();
         assert_eq!(def.max_acquire_sleep_secs, 10.0);
         assert_eq!(def.max_queue_depth, 10_000.0);
+    }
+
+    #[rstest]
+    #[case::negative_sleep("lance_aimd_max_acquire_sleep_secs", "-1")]
+    #[case::zero_sleep("lance_aimd_max_acquire_sleep_secs", "0")]
+    #[case::nan_sleep("lance_aimd_max_acquire_sleep_secs", "NaN")]
+    #[case::negative_depth("lance_aimd_max_queue_depth", "-5")]
+    #[case::zero_depth("lance_aimd_max_queue_depth", "0")]
+    fn from_storage_options_rejects_a_nonpositive_cap(#[case] key: &str, #[case] value: &str) {
+        // A misconfigured cap/floor must be rejected at the boundary rather than
+        // panicking in `Duration::from_secs_f64` deep inside `acquire_token`.
+        let mut opts = std::collections::HashMap::new();
+        opts.insert(key.to_string(), value.to_string());
+        let err = AimdThrottleConfig::from_storage_options(Some(&opts)).unwrap_err();
+        assert!(
+            err.to_string().contains(key),
+            "error should name the offending key, got: {err}"
+        );
     }
 
     #[rstest]

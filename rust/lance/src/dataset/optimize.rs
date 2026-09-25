@@ -290,12 +290,26 @@ pub struct CompactionOptions {
     /// columns.
     /// Defaults to `None` (no limit).
     pub max_source_bytes: Option<u64>,
+    /// FORK PATCH (knowdb) — not in upstream lance v12. v12 ships only the
+    /// per-*run* [`max_source_bytes`](Self::max_source_bytes) (a total budget
+    /// enforced by a `break`, with row-only task formation), which empties the
+    /// plan on a leading wide-row task and never splits a task by bytes.
+    /// Tracked upstream as mmstore#763; delete this knob if v12 gains byte-aware
+    /// task formation + skip-and-continue.
+    ///
     /// Maximum source bytes a SINGLE compaction task may cover. Unlike
     /// [`max_source_bytes`](Self::max_source_bytes), which is a per-*run* budget
     /// that truncates the task list, this bounds task *formation*: bins are
     /// closed by bytes (not only by `target_rows_per_fragment` rows) so no task
     /// exceeds this cap, and a task whose own source bytes already exceed it is
     /// skipped while the rest of the plan is still taken.
+    ///
+    /// This is a task-*formation* bound, NOT a standalone per-pass safety bound:
+    /// an unmeasurable fragment contributes 0 bytes here (see
+    /// [`fragment_source_bytes`]), so on an all-unmeasurable table it is inert
+    /// and cannot cap total pass I/O by itself. Pair it with the per-run
+    /// `max_source_bytes` (which errors on a missing size) for a real per-pass
+    /// byte bound.
     ///
     /// Without it, a MEDIAN-derived `target_rows_per_fragment` sizes a task in
     /// rows that, drawn from the wide side of a bimodal-row-width table (e.g. an
