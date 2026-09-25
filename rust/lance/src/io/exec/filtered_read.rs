@@ -655,7 +655,23 @@ impl FilteredReadStream {
                         )
                         .in_current_span(),
                     )
-                    .map(|thread_result| thread_result.unwrap())
+                    // knowdb patch: a cancelled fragment-read task resolves to
+                    // Err(JoinError) — e.g. the consumer stream was dropped, a request
+                    // was cancelled, or a tokio runtime is shutting down under an
+                    // in-flight scan (routine when tests each run their own
+                    // `#[tokio::test(multi_thread)]` runtime). Surfacing it as an
+                    // execution error ends the scan stream cleanly; the upstream
+                    // `.unwrap()` instead PANICS, which under `panic = "abort"` takes the
+                    // whole process/pod down. The consumer that triggered the
+                    // cancellation is already gone, so this error is typically never
+                    // observed. Upstream lance (incl. `main`) still `.unwrap()`s here;
+                    // drop this patch once that is fixed upstream.
+                    .map(|thread_result| match thread_result {
+                        Ok(fragment_stream) => fragment_stream,
+                        Err(join_error) => Err(Error::execution(format!(
+                            "fragment read task did not complete: {join_error}"
+                        ))),
+                    })
                 }
             })
             .buffered(fragment_readahead);
