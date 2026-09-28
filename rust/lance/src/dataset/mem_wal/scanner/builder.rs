@@ -55,9 +55,22 @@ struct LsmVectorQuery {
     metric_type: Option<DistanceType>,
 }
 
+/// A `pk IN (…)` with more than this many DISTINCT keys routes to the general
+/// dedup scan instead of the point-lookup node. The point-lookup planner
+/// resolves each key independently (`LsmPointLookupPlanner::lookup_many` loops
+/// per key), so an N-key IN costs N lookups — and against an active memtable,
+/// which has no per-generation bloom filter to skip, each lookup is a full
+/// memtable scan, making a large IN O(N × rows). The general scan is one
+/// O(rows) pass, so above this many keys it is strictly cheaper. A small IN
+/// keeps the fast path, where a handful of bloom-guarded per-key lookups beat a
+/// full scan across many SSTable generations. A `pk = lit` single-key point
+/// lookup is never capped.
+const POINT_LOOKUP_MAX_IN_KEYS: usize = 8;
+
 /// If `filter` is a point-lookup shape on `pk_col` — `pk = lit` (either
-/// operand order) or `pk IN (lit, …)` — return the literal key values. Any
-/// other shape returns `None`, so the scanner falls through to the general
+/// operand order) or `pk IN (lit, …)` with at most [`POINT_LOOKUP_MAX_IN_KEYS`]
+/// distinct keys — return the literal key values. Any other shape (including a
+/// larger `IN`) returns `None`, so the scanner falls through to the general
 /// scan plan. `IN` keys are normalized to `pk_type` only for deduplication;
 /// the first original literal is retained so the lookup path still chooses
 /// between its exact-type fast path and coercing fallback. A literal that
@@ -96,6 +109,11 @@ fn extract_pk_point_keys(
                 if seen.insert(identity) {
                     vals.push(lit.clone());
                 }
+            }
+            // A large IN-list is a BATCH resolve, not a point lookup — route it
+            // to the general scan (see POINT_LOOKUP_MAX_IN_KEYS).
+            if vals.len() > POINT_LOOKUP_MAX_IN_KEYS {
+                return None;
             }
             (!vals.is_empty()).then_some(vals)
         }
@@ -1002,6 +1020,36 @@ mod tests {
                 "unsupported point-lookup filter must use the scan path: {filter}"
             );
         }
+    }
+
+    #[test]
+    fn large_in_list_routes_to_scan_not_per_key_point_lookup() {
+        use datafusion::prelude::{col, lit};
+
+        // At the cap: still a point lookup (a handful of bloom-guarded per-key
+        // lookups beat a full scan across many SSTable generations).
+        let at_cap: Vec<_> = (0..POINT_LOOKUP_MAX_IN_KEYS as i32).map(lit).collect();
+        let keys = extract_pk_point_keys(
+            &col("id").in_list(at_cap, false),
+            "id",
+            &DataType::Int32,
+        );
+        assert_eq!(
+            keys.map(|k| k.len()),
+            Some(POINT_LOOKUP_MAX_IN_KEYS),
+            "an IN-list AT the cap must still route to the point-lookup node"
+        );
+
+        // Over the cap: a batch resolve, not a point lookup. It must fall
+        // through to the general scan — the point-lookup planner loops per key
+        // (`lookup_many`), so a large IN over an unindexed active memtable is
+        // O(N × rows), where one scan pass is O(rows).
+        let over_cap: Vec<_> = (0..POINT_LOOKUP_MAX_IN_KEYS as i32 + 1).map(lit).collect();
+        assert!(
+            extract_pk_point_keys(&col("id").in_list(over_cap, false), "id", &DataType::Int32)
+                .is_none(),
+            "an IN-list larger than the cap must use the scan path, not N point lookups"
+        );
     }
 
     #[test]
