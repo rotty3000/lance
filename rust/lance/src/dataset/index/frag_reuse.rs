@@ -85,6 +85,9 @@ impl Dataset {
 ///    in the version is still in its bitmap. A missing bitmap counts as caught
 ///    up, else the version could never be cleaned up.
 ///
+/// A version is retained whenever any index's catch-up cannot be determined
+/// (e.g. the index covers only part of one of the version's rewrite groups).
+///
 /// Note that there could be a race condition that an index is being added during the cleanup,
 /// This will make that specific index not efficient until the next reindex,
 /// but it will not cause any correctness problem.
@@ -125,20 +128,25 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
     for version in frag_reuse_details.versions.iter() {
-        let check_results = indices
-            .iter()
-            .map(|idx| is_index_remap_caught_up(version, idx, &chain_frag_bitmap))
-            .collect::<Vec<_>>();
+        // A version whose catch-up check fails for some index is RETAINED, never
+        // dropped. The two mistakes are not symmetric: keeping a version an index
+        // no longer needs only costs readers a remap that passes already-moved
+        // addresses through unchanged, while dropping one an index still needs
+        // makes readers stop remapping addresses that are still stale, so queries
+        // through that index silently resolve to rows that no longer exist. The
+        // check errors on a rewrite group the index covers only in part; that
+        // index stays pinned until it is rebuilt, which replaces its bitmap.
+        let caught_up = indices.iter().all(|idx| {
+            is_index_remap_caught_up(version, idx, &chain_frag_bitmap).unwrap_or_else(|err| {
+                warn!(
+                    "Retaining fragment reuse version {}: cannot determine whether index {} ({}) caught up with it: {}",
+                    version.dataset_version, idx.name, idx.uuid, err
+                );
+                false
+            })
+        });
 
-        if check_results
-            .iter()
-            .any(|r| matches!(r, Err(Error::InvalidInput { .. })))
-        {
-            // If the check fails, the reuse version is likely corrupted, do not retain it.
-            continue;
-        }
-
-        if !check_results.into_iter().all(|r| r.unwrap()) {
+        if !caught_up {
             fragment_bitmaps.extend(version.new_frag_bitmap());
             retained_versions.push(version.clone());
         }
@@ -459,6 +467,161 @@ mod tests {
         assert!(matches!(
             cleanup_frag_reuse_index(&mut dataset_clone).await,
             Err(Error::RetryableCommitConflict { .. })
+        ));
+    }
+
+    /// An index whose catch-up check errors (here: it covers only part of a
+    /// rewrite group) must pin the reuse version, not drop it. Dropping a version
+    /// some index still needs stops readers remapping addresses that are still
+    /// stale; retaining one only costs a no-op remap.
+    #[tokio::test]
+    async fn test_cleanup_frag_reuse_index_retains_version_on_check_error() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        // Catch the real index up, so the only thing that can keep the version
+        // alive is the check error below.
+        remapping::remap_column_index(&mut dataset, &["i"], Some("i_idx".into()))
+            .await
+            .unwrap();
+
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        let details = load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+            .await
+            .unwrap();
+        assert_eq!(details.versions.len(), 1);
+        let group = &details.versions[0].groups[0];
+        assert!(
+            group.old_frags.len() >= 2,
+            "fixture needs a multi-fragment rewrite group, got {:?}",
+            group.old_frags
+        );
+
+        // A segment that covers exactly one fragment of that group, stamped at
+        // the current version so it passes the version gate and reaches the
+        // split-group check.
+        let real_index = dataset
+            .load_indices()
+            .await
+            .unwrap()
+            .iter()
+            .find(|idx| idx.name == "i_idx")
+            .unwrap()
+            .clone();
+        let straddle = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            name: "straddle".into(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::from_iter([group.old_frags[0].id as u32])),
+            ..real_index
+        };
+        let chain = reuse_chain_frag_bitmap(&details.versions);
+        assert!(
+            matches!(
+                is_index_remap_caught_up(&details.versions[0], &straddle, &chain),
+                Err(Error::InvalidInput { .. })
+            ),
+            "fixture must exercise the check-error path"
+        );
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![straddle],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        cleanup_frag_reuse_index(&mut dataset).await.unwrap();
+        let frag_reuse_index_meta = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("Fragment reuse index must be available");
+        assert_eq!(
+            load_frag_reuse_index_details(&dataset, &frag_reuse_index_meta)
+                .await
+                .unwrap()
+                .versions
+                .len(),
+            1,
+            "a version whose catch-up check errored must be retained"
+        );
+    }
+
+    /// A malformed reuse index must surface as an error, not a panic (release
+    /// builds commonly abort on panic).
+    #[tokio::test]
+    async fn test_cleanup_frag_reuse_index_propagates_load_error() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(100))
+            .await
+            .unwrap();
+        let bogus = IndexMetadata {
+            uuid: uuid::Uuid::new_v4(),
+            fields: vec![],
+            covering_fields: vec![],
+            name: FRAG_REUSE_INDEX_NAME.into(),
+            dataset_version: dataset.manifest.version,
+            fragment_bitmap: Some(RoaringBitmap::new()),
+            // Not a FragmentReuseIndexDetails payload.
+            index_details: Some(Arc::new(
+                prost_types::Any::from_msg(&lance_index::pbold::BTreeIndexDetails::default())
+                    .unwrap(),
+            )),
+            index_version: 0,
+            created_at: None,
+            base_id: None,
+            files: None,
+        };
+        let transaction = Transaction::new(
+            dataset.manifest.version,
+            Operation::CreateIndex {
+                new_indices: vec![bogus],
+                removed_indices: vec![],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            cleanup_frag_reuse_index(&mut dataset).await,
+            Err(Error::Index { .. })
         ));
     }
 
