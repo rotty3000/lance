@@ -431,6 +431,73 @@ fn select_segments_to_merge<'a>(
     selected
 }
 
+/// The `dataset_version` to stamp on a segment that merged `sources` (plus any
+/// unindexed data read at the current version) and now covers `coverage`.
+///
+/// A segment's `dataset_version` is a watermark two consumers compare against:
+/// [`cleanup_frag_reuse_index`] keeps a fragment-reuse (FRI) version until every
+/// index is at or past it, and the overlay staleness check masks from an index
+/// any overlaid cell on an indexed field committed after it. Stamping the
+/// OLDEST source's version is always safe -- it claims nothing about rows the
+/// merge did not re-derive -- but it means a merge never counts as caught up, so
+/// with deferred remap the FRI grows without bound even when the merge
+/// physically rewrote every row through it.
+///
+/// The version the merge read is safe instead exactly when both hold:
+///
+/// 1. `rows_remapped`: every source row was written to the output through the
+///    dataset's FRI as of the read version (all of its versions, chained), so
+///    no address in the output predates an FRI version the read could see.
+///    Callers pass `true` only for merge implementations verified to do so.
+/// 2. No fragment in `coverage` carries an overlay on an indexed field committed
+///    after the oldest source. A merge copies source entries rather than
+///    re-reading values, so such an overlay is not reflected in the output, and
+///    only the old stamp keeps the query path masking the overlaid cells.
+///
+/// [`cleanup_frag_reuse_index`]: crate::dataset::index::frag_reuse::cleanup_frag_reuse_index
+fn merged_segment_dataset_version(
+    dataset: &Dataset,
+    sources: &[&IndexMetadata],
+    coverage: &RoaringBitmap,
+    rows_remapped: bool,
+) -> Result<u64> {
+    let Some(oldest_source_version) = sources.iter().map(|index| index.dataset_version).min()
+    else {
+        return Ok(dataset.manifest.version);
+    };
+    if !rows_remapped {
+        return Ok(oldest_source_version);
+    }
+
+    let overlaid_frags = crate::dataset::overlay::overlaid_fragments(&dataset.manifest.fragments);
+    if !overlaid_frags.is_empty() {
+        let mut fields = sources
+            .iter()
+            .flat_map(|index| index.fields.iter().copied())
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        fields.dedup();
+        // Probe the merged segment as it would look under the conservative stamp.
+        let probe = IndexMetadata {
+            fields,
+            dataset_version: oldest_source_version,
+            fragment_bitmap: Some(coverage.clone()),
+            ..sources[0].clone()
+        };
+        let mut stale = RoaringBitmap::new();
+        crate::dataset::overlay::collect_overlay_stale_frags(
+            &probe,
+            &overlaid_frags,
+            &mut stale,
+            dataset.schema(),
+        )?;
+        if !stale.is_empty() {
+            return Ok(oldest_source_version);
+        }
+    }
+    Ok(dataset.manifest.version)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn merge_scalar_indices<'a>(
     dataset: Arc<Dataset>,
@@ -546,6 +613,11 @@ async fn merge_scalar_indices<'a>(
             None
         };
 
+        // Whether every selected source row reached the output through the
+        // dataset's FRI (see `merged_segment_dataset_version`). Set only by the
+        // merge arms verified to remap; the seed path, NGram and the generic
+        // single-segment `update` keep the conservative stamp.
+        let mut rows_remapped = false;
         let created_index = if let Some(created) = maybe_created {
             created
         } else {
@@ -561,7 +633,7 @@ async fn merge_scalar_indices<'a>(
                 IndexType::BTree => {
                     let (_, old_data_filters) =
                         build_per_segment_filters(dataset.as_ref(), &selected_old_indices).await?;
-                    crate::index::scalar::btree::open_and_merge_segments(
+                    let created = crate::index::scalar::btree::open_and_merge_segments(
                         dataset.as_ref(),
                         field_path,
                         &selected_old_indices,
@@ -569,7 +641,14 @@ async fn merge_scalar_indices<'a>(
                         &new_store,
                         &old_data_filters,
                     )
-                    .await?
+                    .await?;
+                    // Each source is opened through `open_scalar_index`, which
+                    // binds the dataset's current FRI, and
+                    // `BTreeIndex::merge_segments` remaps every source page
+                    // stream through it (dropping FRI-deleted rows) before the
+                    // old-data filter and the k-way merge.
+                    rows_remapped = true;
+                    created
                 }
                 IndexType::NGram => {
                     let (_, old_data_filters) =
@@ -596,12 +675,13 @@ async fn merge_scalar_indices<'a>(
                 }
             }
         };
-        let source_dataset_version = selected_old_indices
-            .iter()
-            .map(|index| index.dataset_version)
-            .min()
-            .unwrap_or(dataset.manifest.version);
-        (created_index, source_dataset_version)
+        let new_dataset_version = merged_segment_dataset_version(
+            dataset.as_ref(),
+            &selected_old_indices,
+            &frag_bitmap,
+            rows_remapped,
+        )?;
+        (created_index, new_dataset_version)
     };
 
     Ok(Some((
@@ -1306,11 +1386,22 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                                 options.progress.clone(),
                             )
                             .await?,
-                            selected_old_indices
-                                .iter()
-                                .map(|index| index.dataset_version)
-                                .min()
-                                .unwrap_or(dataset.manifest.version),
+                            // Each source is opened through `open_scalar_index`,
+                            // which binds the dataset's current FRI to every
+                            // partition's document store (modern: the
+                            // `PartitionDocuments` remapper, rebound by
+                            // `with_store` on a cache hit; legacy: applied at
+                            // `DocSet::load`). The merge rebuilds each partition
+                            // from that FRI-mapped `DocSet`
+                            // (`InvertedPartition::into_builder`), so every
+                            // written row id is post-FRI; FRI-deleted docs are
+                            // tombstoned and then dropped by the fragment filter.
+                            merged_segment_dataset_version(
+                                dataset.as_ref(),
+                                &selected_old_indices,
+                                &frag_bitmap,
+                                true,
+                            )?,
                         )
                     };
 
@@ -4789,5 +4880,441 @@ mod tests {
             .unwrap()
             .num_rows();
         assert_eq!(total, 150, "no rows may be lost across compaction + merge");
+    }
+
+    // ---- merged-segment dataset_version stamp (deferred index remap) ----
+    //
+    // A merge that rewrote every source row through the fragment-reuse index
+    // (FRI) is stamped with the version it read, so `cleanup_frag_reuse_index`
+    // can trim the FRI after it; anything else keeps the oldest source's stamp.
+
+    /// `id` = range, `body` = "row{id} common".
+    fn id_body_batch(range: std::ops::Range<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(range.clone())),
+                Arc::new(StringArray::from_iter_values(
+                    range.map(|i| format!("row{i} common")),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    async fn append_id_body(dataset: &mut Dataset, range: std::ops::Range<i32>) {
+        let batch = id_body_batch(range);
+        let schema = batch.schema();
+        dataset
+            .append(RecordBatchIterator::new(vec![Ok(batch)], schema), None)
+            .await
+            .unwrap();
+    }
+
+    async fn fri_versions(dataset: &Dataset) -> usize {
+        dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .map_or(0, |fri| fri.details.versions.len())
+    }
+
+    /// Rows matching a SQL `filter` (scalar-index eligible on `id`).
+    async fn count_filter(dataset: &Dataset, filter: &str) -> usize {
+        dataset
+            .scan()
+            .filter(filter)
+            .unwrap()
+            .project(&["id"])
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap()
+            .num_rows()
+    }
+
+    async fn count_fts(dataset: &Dataset, query: &str) -> usize {
+        let mut scan = dataset.scan();
+        scan.full_text_search(lance_index::scalar::FullTextSearchQuery::new(
+            query.to_owned(),
+        ))
+        .unwrap();
+        scan.count_rows().await.unwrap() as usize
+    }
+
+    /// Two segments on `idx`, the older one predating a deferred-remap
+    /// compaction, plus one unindexed fragment:
+    ///
+    /// * `id` 0..400 in four 100-row fragments; `idx` built on `column`.
+    /// * delete `id < 30`, then a deferred-remap compaction (one FRI version).
+    /// * delete `250 <= id < 260` after the compaction.
+    /// * append 400..450 and index it as a delta segment (current stamp).
+    /// * append 450..500, left unindexed.
+    ///
+    /// Live rows: 500 - 30 - 10 = 460.
+    async fn deferred_remap_two_segment_fixture(
+        uri: &str,
+        column: &str,
+        index_type: IndexType,
+    ) -> Dataset {
+        let batch = id_body_batch(0..400);
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch)], schema),
+            uri,
+            Some(WriteParams {
+                max_rows_per_file: 100,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(dataset.get_fragments().len(), 4);
+        match index_type {
+            IndexType::Inverted => dataset
+                .create_index(
+                    &[column],
+                    IndexType::Inverted,
+                    Some("idx".into()),
+                    &InvertedIndexParams::default(),
+                    false,
+                )
+                .await
+                .unwrap(),
+            _ => dataset
+                .create_index(
+                    &[column],
+                    index_type,
+                    Some("idx".into()),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                    false,
+                )
+                .await
+                .unwrap(),
+        };
+
+        dataset.delete("id < 30").await.unwrap();
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 200,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 1);
+        dataset.delete("id >= 250 AND id < 260").await.unwrap();
+
+        append_id_body(&mut dataset, 400..450).await;
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        append_id_body(&mut dataset, 450..500).await;
+        assert_eq!(dataset.load_indices_by_name("idx").await.unwrap().len(), 2);
+
+        // The pre-compaction segment still needs the FRI.
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 1);
+        dataset
+    }
+
+    async fn assert_id_queries(dataset: &Dataset) {
+        for (filter, expected) in [
+            ("id = 10", 0),  // deleted before the compaction
+            ("id = 255", 0), // deleted after the compaction
+            ("id = 30", 1),
+            ("id = 100", 1),
+            ("id = 399", 1),
+            ("id = 420", 1),
+            ("id = 470", 1),
+            ("id IN (5, 150, 255, 305, 480)", 3),
+            ("id >= 0", 460),
+        ] {
+            assert_eq!(
+                count_filter(dataset, filter).await,
+                expected,
+                "wrong result for {filter}"
+            );
+        }
+    }
+
+    /// A BTree merge of EVERY segment rewrote all rows through the FRI, so it is
+    /// stamped current and the FRI trims to zero, with queries still exact.
+    #[tokio::test]
+    async fn test_btree_full_merge_after_deferred_remap_lets_fri_trim() {
+        let test_dir = TempStrDir::default();
+        let mut dataset =
+            deferred_remap_two_segment_fixture(test_dir.as_str(), "id", IndexType::BTree).await;
+
+        let read_version = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("idx").await.unwrap();
+        assert_eq!(segments.len(), 1, "every segment must have merged");
+        assert_eq!(
+            segments[0].dataset_version, read_version,
+            "a full merge through the FRI must be stamped with the version it read"
+        );
+
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 0, "the FRI must trim to zero");
+
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 0);
+        assert_id_queries(&dataset).await;
+    }
+
+    /// Same for the FTS consolidation merge.
+    #[tokio::test]
+    async fn test_fts_full_merge_after_deferred_remap_lets_fri_trim() {
+        let test_dir = TempStrDir::default();
+        let mut dataset =
+            deferred_remap_two_segment_fixture(test_dir.as_str(), "body", IndexType::Inverted)
+                .await;
+
+        let read_version = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(2))
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("idx").await.unwrap();
+        assert_eq!(segments.len(), 1, "every segment must have merged");
+        assert_eq!(
+            segments[0].dataset_version, read_version,
+            "a full merge through the FRI must be stamped with the version it read"
+        );
+
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 0, "the FRI must trim to zero");
+
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        assert_eq!(fri_versions(&dataset).await, 0);
+        for (query, expected) in [
+            ("row10", 0),  // deleted before the compaction
+            ("row255", 0), // deleted after the compaction
+            ("row30", 1),
+            ("row100", 1),
+            ("row399", 1),
+            ("row420", 1),
+            ("row470", 1),
+            ("common", 460),
+        ] {
+            assert_eq!(
+                count_fts(&dataset, query).await,
+                expected,
+                "wrong FTS result for {query}"
+            );
+        }
+    }
+
+    /// Merging only SOME segments leaves the unmerged, pre-compaction segment on
+    /// its old stamp, so cleanup must keep the FRI version it still needs.
+    #[tokio::test]
+    async fn test_partial_merge_after_deferred_remap_keeps_needed_fri_version() {
+        let test_dir = TempStrDir::default();
+        let mut dataset =
+            deferred_remap_two_segment_fixture(test_dir.as_str(), "id", IndexType::BTree).await;
+        let fri_version = dataset
+            .frag_reuse_index()
+            .await
+            .unwrap()
+            .unwrap()
+            .details
+            .versions[0]
+            .dataset_version;
+
+        // Merges only the trailing (delta) segment with the unindexed fragment.
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("idx").await.unwrap();
+        assert_eq!(segments.len(), 2, "the old segment must be left unmerged");
+        assert!(
+            segments
+                .iter()
+                .any(|segment| segment.dataset_version < fri_version),
+            "the unmerged segment must keep its pre-compaction stamp: {segments:?}"
+        );
+
+        crate::dataset::index::frag_reuse::cleanup_frag_reuse_index(&mut dataset)
+            .await
+            .unwrap();
+        assert_eq!(
+            fri_versions(&dataset).await,
+            1,
+            "the FRI version the unmerged segment needs must be retained"
+        );
+
+        let dataset = DatasetBuilder::from_uri(test_dir.as_str())
+            .load()
+            .await
+            .unwrap();
+        assert_id_queries(&dataset).await;
+    }
+
+    /// A merge copies source entries, it does not re-read values: an overlay on
+    /// an indexed field committed after the source segment is NOT in the merged
+    /// output, so the merge must keep the source's stamp for the query path to
+    /// keep masking the overlaid cells.
+    #[tokio::test]
+    async fn test_merge_keeps_source_stamp_under_newer_indexed_overlay() {
+        use crate::dataset::WriteDestination;
+        use crate::dataset::transaction::{DataOverlayGroup, Operation};
+        use lance_file::writer::FileWriterOptions;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("val", DataType::Int32, true),
+        ]));
+        let make = |range: std::ops::Range<i32>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from_iter_values(range.clone())),
+                    Arc::new(Int32Array::from_iter_values(range.map(|v| v * 10))),
+                ],
+            )
+            .unwrap()
+        };
+        let write_params = WriteParams {
+            max_rows_per_file: 6,
+            max_rows_per_group: 6,
+            data_storage_version: Some(LanceFileVersion::Stable),
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(make(0..12))], schema.clone()),
+            test_uri,
+            Some(write_params.clone()),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["val"],
+                IndexType::BTree,
+                Some("val_idx".into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+        let index_version =
+            dataset.load_indices_by_name("val_idx").await.unwrap()[0].dataset_version;
+
+        // Overlay fragment 0, offset 0: val 0 -> 1000, committed after the index.
+        let val_field_id = dataset.schema().field("val").unwrap().id;
+        let read_version = dataset.version().version;
+        let filename = format!("{}.lance", Uuid::new_v4());
+        let path = dataset.data_dir().join(filename.as_str());
+        let file_version = LanceFileVersion::Stable.resolve();
+        let mut writer = lance_file::versions::create_writer(
+            file_version,
+            dataset.object_store.create(&path).await.unwrap(),
+            dataset.schema().project_by_ids(&[val_field_id], true),
+            FileWriterOptions::default(),
+        )
+        .unwrap();
+        writer
+            .write_column(0, Arc::new(Int32Array::from(vec![1000])))
+            .await
+            .unwrap();
+        let summary = writer.finish().await.unwrap();
+        let mut data_file = DataFile::new_unstarted(filename, file_version);
+        data_file.fields = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(field_id, _)| *field_id as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.column_indices = writer
+            .field_id_to_column_indices()
+            .iter()
+            .map(|(_, column_index)| *column_index as i32)
+            .collect::<Vec<_>>()
+            .into();
+        data_file.file_size_bytes = CachedFileSize::new(summary.size_bytes);
+        let mut dataset = Dataset::commit(
+            WriteDestination::Dataset(Arc::new(dataset)),
+            Operation::DataOverlay {
+                groups: vec![DataOverlayGroup {
+                    fragment_id: 0,
+                    overlays: vec![DataOverlayFile {
+                        data_file,
+                        coverage: OverlayCoverage::dense(RoaringBitmap::from_iter([0u32])),
+                        committed_version: 0,
+                    }],
+                }],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // One unindexed fragment, so a merge(1) has work to do.
+        dataset
+            .append(
+                RecordBatchIterator::new(vec![Ok(make(12..18))], schema.clone()),
+                Some(write_params),
+            )
+            .await
+            .unwrap();
+        let merge_read_version = dataset.manifest.version;
+        dataset
+            .optimize_indices(&OptimizeOptions::merge(1))
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("val_idx").await.unwrap();
+        assert_eq!(segments.len(), 1);
+        assert!(merge_read_version > index_version);
+        assert_eq!(
+            segments[0].dataset_version, index_version,
+            "a merge must not claim an overlay its source rows predate"
+        );
+
+        let dataset = DatasetBuilder::from_uri(test_uri).load().await.unwrap();
+        for (filter, expected) in [
+            ("val = 1000", 1), // the overlaid value
+            ("val = 0", 0),    // the value the overlay replaced
+            ("val = 50", 1),
+            ("val = 150", 1),
+        ] {
+            assert_eq!(
+                count_filter(&dataset, filter).await,
+                expected,
+                "wrong result for {filter}"
+            );
+        }
     }
 }
