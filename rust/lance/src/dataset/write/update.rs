@@ -549,6 +549,22 @@ impl UpdateJob {
         dataset: Arc<Dataset>,
         update_data: UpdateData,
     ) -> Result<UpdateResult> {
+        // Nothing matched, so nothing was written: commit no version. An empty
+        // Update still takes a manifest CAS and pre-empts concurrent writers
+        // (compaction) for nothing, and a conditional writer whose predicate
+        // lost a race issues one every time. With no affected rows it can never
+        // conflict, so skipping it changes nothing but the version number.
+        if update_data.num_updated_rows == 0
+            && update_data.removed_fragment_ids.is_empty()
+            && update_data.old_fragments.is_empty()
+            && update_data.new_fragments.is_empty()
+        {
+            return Ok(UpdateResult {
+                new_dataset: dataset,
+                rows_updated: 0,
+            });
+        }
+
         // Updated columns are top-level (nested references are rejected by `set`), but a
         // struct-column update rewrites all of its descendants. Collect the full field
         // subtree so an index on a nested child field is recognized as modified and not
@@ -885,6 +901,38 @@ mod tests {
                 .to_string()
                 .contains("V1 and V2 storage versions cannot be mixed")
         );
+    }
+
+    /// An UPDATE whose predicate matches no rows commits NO version. Each such
+    /// commit takes a manifest CAS and pre-empts concurrent compaction for
+    /// nothing; a conditional writer whose fence lost (e.g. a claim CAS another
+    /// writer won) issues them routinely.
+    #[tokio::test]
+    async fn update_matching_no_rows_commits_no_version() {
+        let (dataset, _test_dir) = make_test_dataset(LanceFileVersion::V2_0, false).await;
+        let before = dataset.manifest.version;
+        let versions_before = dataset.versions().await.unwrap().len();
+
+        let result = UpdateBuilder::new(dataset.clone())
+            .update_where("id < 0")
+            .unwrap()
+            .set("name", "'bar'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows_updated, 0);
+        assert_eq!(result.new_dataset.manifest.version, before);
+        let mut reopened = (*dataset).clone();
+        reopened.checkout_latest().await.unwrap();
+        assert_eq!(
+            reopened.manifest.version, before,
+            "no version was committed"
+        );
+        assert_eq!(reopened.versions().await.unwrap().len(), versions_before);
     }
 
     #[tokio::test]
