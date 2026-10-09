@@ -210,6 +210,7 @@ impl DeleteBuilder {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            nothing_matched: _,
         } = data;
         let transaction = job.build_transaction(
             job.dataset.as_ref(),
@@ -237,6 +238,10 @@ struct DeleteData {
     deleted_fragment_ids: Vec<u64>,
     affected_rows: Option<RowAddrTreeMap>,
     num_deleted_rows: u64,
+    /// A scanned predicate matched no rows: there is nothing to commit. A
+    /// literal `false` predicate never sets this — it is the explicit
+    /// "commit a no-op write" idiom (e.g. metadata migration).
+    nothing_matched: bool,
 }
 
 impl DeleteJob {
@@ -283,6 +288,7 @@ impl RetryExecutor for DeleteJob {
         }
 
         // Check if the filter optimized to true (delete everything) or false (delete nothing)
+        let mut nothing_matched = false;
         let (updated_fragments, deleted_fragment_ids, affected_rows, num_deleted_rows) =
             if let Some(filter_expr) = scanner.get_expr_filter()? {
                 if matches!(
@@ -331,6 +337,8 @@ impl RetryExecutor for DeleteJob {
                     let (fragments, deleted_ids) =
                         apply_deletions(&self.dataset, &removed_row_addrs).await?;
                     let num_deleted_rows = removed_row_addrs.len();
+                    nothing_matched =
+                        num_deleted_rows == 0 && fragments.is_empty() && deleted_ids.is_empty();
                     let affected_rows = RowAddrTreeMap::from(removed_row_addrs.as_ref().clone());
                     (
                         fragments,
@@ -349,6 +357,7 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            nothing_matched,
         })
     }
 
@@ -358,7 +367,18 @@ impl RetryExecutor for DeleteJob {
             deleted_fragment_ids,
             affected_rows,
             num_deleted_rows,
+            nothing_matched,
         } = data;
+        // Nothing matched, so nothing changed: commit no version. An empty
+        // Delete still takes a manifest CAS and pre-empts concurrent writers
+        // (compaction), and a best-effort conditional delete issues one every
+        // time its row is absent.
+        if nothing_matched {
+            return Ok(DeleteResult {
+                new_dataset: dataset,
+                num_deleted_rows: 0,
+            });
+        }
         let transaction =
             self.build_transaction(dataset.as_ref(), updated_fragments, deleted_fragment_ids);
 
@@ -660,6 +680,42 @@ mod tests {
         // Fragment 1 (rows 100-199) should be fully deleted or have 50 deletions (100-149)
         let frag1_dv = fragments[1].get_deletion_vector().await.unwrap().unwrap();
         assert_eq!(frag1_dv.len(), 50);
+    }
+
+    /// A scanned predicate that matches no rows commits NO version: nothing
+    /// changed, and an empty commit still takes a manifest CAS and pre-empts
+    /// concurrent writers (compaction). A literal `false` predicate still
+    /// commits (`test_delete_false_predicate_still_commits`): that is the
+    /// explicit "commit a no-op write" idiom (e.g. metadata migration).
+    #[tokio::test]
+    async fn test_delete_matching_no_rows_commits_no_version() {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::UInt32,
+            false,
+        )]));
+        let data = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(UInt32Array::from_iter_values(0..100))],
+        )
+        .unwrap();
+        let tmp_dir = TempStrDir::default();
+        let mut dataset = TestDatasetGenerator::new(vec![data], LanceFileVersion::Stable)
+            .make_hostile(tmp_dir.as_str())
+            .await;
+        let initial_version = dataset.version().version;
+
+        let result = dataset.delete("i >= 1000").await.unwrap();
+
+        assert_eq!(result.num_deleted_rows, 0);
+        assert_eq!(dataset.version().version, initial_version);
+        dataset.checkout_latest().await.unwrap();
+        assert_eq!(
+            dataset.version().version,
+            initial_version,
+            "no version was committed"
+        );
+        assert_eq!(dataset.count_rows(None).await.unwrap(), 100);
     }
 
     #[tokio::test]
