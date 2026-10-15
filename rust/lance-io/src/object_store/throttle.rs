@@ -45,7 +45,7 @@ use object_store::{
     UploadPart,
 };
 use rand::Rng;
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 use tracing::{debug, warn};
 
 use object_store::list::{PaginatedListOptions, PaginatedListResult, PaginatedListStore};
@@ -378,6 +378,16 @@ struct TokenBucketState {
 /// Per-category throttle state: an AIMD controller paired with a token bucket.
 struct OperationThrottle {
     controller: AimdController,
+    /// A `std::sync::Mutex`, never a `tokio::sync::Mutex`: every critical
+    /// section here is await-free (refill arithmetic, a rate store), and a tokio
+    /// mutex hands its FIFO permit to the head waiter's FUTURE. A waiter future
+    /// that is then never polled again — a member of a `buffered` stream its
+    /// owner has stopped polling, while the owner awaits another operation on
+    /// the same throttle — keeps the permit forever and wedges EVERY request
+    /// through this store with all threads idle (knowdb #891: two smg
+    /// maintenance wedges, 11–18 tasks queued on this lock, no holder running).
+    /// A std mutex is held only for the synchronous section, so an un-polled
+    /// future can never hold it.
     bucket: Mutex<TokenBucketState>,
     burst_capacity: f64,
     max_retries: usize,
@@ -462,7 +472,10 @@ impl OperationThrottle {
     /// sustained throttling (the AIMD rate reduction stays the real throttle).
     async fn acquire_token(&self) {
         let sleep_duration = {
-            let mut bucket = self.bucket.lock().await;
+            let mut bucket = self
+                .bucket
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let now = tokio::time::Instant::now();
             let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
             bucket.tokens = (bucket.tokens + elapsed * bucket.rate).min(self.burst_capacity);
@@ -489,8 +502,11 @@ impl OperationThrottle {
     }
 
     /// Update the bucket's fill rate from the controller.
-    async fn update_bucket_rate(&self, new_rate: f64) {
-        let mut bucket = self.bucket.lock().await;
+    fn update_bucket_rate(&self, new_rate: f64) {
+        let mut bucket = self
+            .bucket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         bucket.rate = new_rate;
     }
 
@@ -577,7 +593,7 @@ impl OperationThrottle {
                 .err()
                 .map(|error| error as &dyn std::fmt::Display);
             let new_rate = self.record_outcome(outcome, error);
-            self.update_bucket_rate(new_rate).await;
+            self.update_bucket_rate(new_rate);
 
             match &result {
                 Err(err) if is_throttle_error(err) && attempt < self.max_retries => {
@@ -880,7 +896,7 @@ impl HttpService for AimdMultipartUploadService {
                 RequestOutcome::Success
             };
             let new_rate = write.record_outcome(outcome, error);
-            write.update_bucket_rate(new_rate).await;
+            write.update_bucket_rate(new_rate);
 
             if is_retryable && attempt < write.max_retries {
                 let backoff_ms =
@@ -1446,6 +1462,50 @@ mod tests {
                 }),
             }
         }
+    }
+
+    /// knowdb #891: an acquirer future that was polled once while the bucket was
+    /// contended, and is then kept ALIVE but never polled again, must not block
+    /// another acquirer. With a tokio mutex the release hands the permit to
+    /// that parked future and every later acquirer waits forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_parked_bucket_acquirer_never_blocks_another() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let throttle = Arc::new(
+            OperationThrottle::new(
+                AimdConfig::default().with_initial_rate(1000.0),
+                1000.0,
+                0,
+                0,
+                0,
+                std::time::Duration::from_secs(1),
+                100.0,
+            )
+            .unwrap(),
+        );
+        // A holder keeps the bucket locked on another OS thread for a moment.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let throttle = throttle.clone();
+            std::thread::spawn(move || {
+                let _guard = throttle.bucket.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            })
+        };
+        locked_rx.recv().unwrap();
+        // A: polled ONCE while the bucket is contended, then parked — alive,
+        // never polled again, never dropped until the end of the test.
+        let mut parked = Box::pin(throttle.acquire_token());
+        let waker = futures::task::noop_waker();
+        let _ = parked.as_mut().poll(&mut Context::from_waker(&waker)) == Poll::Ready(());
+        holder.join().unwrap();
+        // B must finish promptly while A is still alive and unpolled.
+        tokio::time::timeout(std::time::Duration::from_secs(2), throttle.acquire_token())
+            .await
+            .expect("a parked acquirer must not block another (knowdb #891)");
+        drop(parked);
     }
 
     #[tokio::test(start_paused = true)]
