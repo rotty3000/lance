@@ -73,6 +73,13 @@ impl NullableRowAddrSet {
         &self.selected
     }
 
+    /// Keep only the rows of `frag_ids`, in both the selection and the null set.
+    pub fn retain_fragments(&mut self, frag_ids: impl IntoIterator<Item = u32>) {
+        let frag_ids: Vec<u32> = frag_ids.into_iter().collect();
+        self.selected.retain_fragments(frag_ids.iter().copied());
+        self.nulls.retain_fragments(frag_ids);
+    }
+
     /// Get the TRUE rows (selected but not null)
     pub fn true_rows(&self) -> RowAddrTreeMap {
         self.selected.clone() - self.nulls.clone()

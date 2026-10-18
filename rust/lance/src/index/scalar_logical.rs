@@ -38,6 +38,13 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 /// containing `AtLeast` results yields `AtLeast`. Combining `AtMost` and `AtLeast` segments in
 /// the same query is not supported.
 ///
+/// A segment's physical data can hold rows of fragments its manifest coverage no longer
+/// claims: an in-place column rewrite removes the fragment from the coverage of every index on
+/// a rewritten column, but leaves that segment's entries for it, with the OLD values. Once a
+/// later segment covers the fragment again, the scanner's mask (the UNION of every segment's
+/// coverage) would let those stale entries through, so each segment's result is restricted to
+/// its own coverage ([`Self::with_segment_coverage`]) before the union.
+///
 /// This is a read-only wrapper. [`ScalarIndex::remap`] and [`ScalarIndex::update`] both return
 /// an error — callers must rebuild the index to consolidate segments before mutating it.
 #[derive(Debug)]
@@ -46,6 +53,9 @@ pub struct LogicalScalarIndex {
     column: String,
     index_type: IndexType,
     segments: Vec<Arc<dyn ScalarIndex>>,
+    /// Each segment's manifest fragment coverage (parallel to `segments`); `None` = unknown,
+    /// the segment's result is used as is.
+    coverage: Vec<Option<RoaringBitmap>>,
 }
 
 impl LogicalScalarIndex {
@@ -77,12 +87,45 @@ impl LogicalScalarIndex {
             )));
         }
 
+        let coverage = vec![None; segments.len()];
         Ok(Self {
             name,
             column,
             index_type,
             segments,
+            coverage,
         })
+    }
+
+    /// Restrict each segment's search result to its manifest fragment coverage (parallel to
+    /// the segments passed to [`Self::try_new`]). The caller supplies coverage only when the
+    /// results are row ADDRESSES (a row id is its address unless the dataset uses stable row
+    /// ids): a stable row id cannot be placed in a fragment without the row-id index.
+    pub fn with_segment_coverage(mut self, coverage: Vec<Option<RoaringBitmap>>) -> Result<Self> {
+        if coverage.len() != self.segments.len() {
+            return Err(Error::invalid_input(format!(
+                "LogicalScalarIndex '{}' on column '{}': {} coverage entries for {} segments",
+                self.name,
+                self.column,
+                coverage.len(),
+                self.segments.len()
+            )));
+        }
+        self.coverage = coverage;
+        Ok(self)
+    }
+}
+
+/// Keep only the rows of `coverage`'s fragments in a segment's result.
+fn restrict_to_coverage(result: SearchResult, coverage: &RoaringBitmap) -> SearchResult {
+    let restrict = |mut set: NullableRowAddrSet| {
+        set.retain_fragments(coverage.iter());
+        set
+    };
+    match result {
+        SearchResult::Exact(set) => SearchResult::Exact(restrict(set)),
+        SearchResult::AtMost(set) => SearchResult::AtMost(restrict(set)),
+        SearchResult::AtLeast(set) => SearchResult::AtLeast(restrict(set)),
     }
 }
 
@@ -91,6 +134,12 @@ impl DeepSizeOf for LogicalScalarIndex {
         self.name.deep_size_of_children(context)
             + self.column.deep_size_of_children(context)
             + self.segments.deep_size_of_children(context)
+            + self
+                .coverage
+                .iter()
+                .flatten()
+                .map(RoaringBitmap::serialized_size)
+                .sum::<usize>()
     }
 }
 
@@ -160,6 +209,14 @@ impl ScalarIndex for LogicalScalarIndex {
                 .map(|segment| segment.search_with_options(query, options, metrics)),
         )
         .await?;
+        let results = results
+            .into_iter()
+            .zip(&self.coverage)
+            .map(|(result, coverage)| match coverage {
+                Some(coverage) => restrict_to_coverage(result, coverage),
+                None => result,
+            })
+            .collect();
         combine_search_results(results)
     }
 
@@ -381,11 +438,24 @@ pub async fn open_scalar_index_segments(
             }))
             .await?;
 
-            Ok(Arc::new(LogicalScalarIndex::try_new(
-                index_name.to_string(),
-                column.to_string(),
-                segments,
-            )?) as Arc<dyn ScalarIndex>)
+            let logical =
+                LogicalScalarIndex::try_new(index_name.to_string(), column.to_string(), segments)?;
+            // A result is a row address when the index says so, or when row ids ARE addresses
+            // (no stable row ids). Residual: with stable row ids the stale entries are not
+            // masked here.
+            let ids_are_addresses =
+                logical.results_are_row_addresses() || !dataset.manifest.uses_stable_row_ids();
+            let logical = if ids_are_addresses {
+                logical.with_segment_coverage(
+                    indices
+                        .iter()
+                        .map(|index| index.fragment_bitmap.clone())
+                        .collect(),
+                )?
+            } else {
+                logical
+            };
+            Ok(Arc::new(logical) as Arc<dyn ScalarIndex>)
         }
     }
 }

@@ -13749,6 +13749,58 @@ MergeInsert: on=[id], when_matched=DoNothing, when_not_matched=InsertAll, when_n
         }
     }
 
+    // Query-side twin of `test_partial_merge_insert_stale_index_ambiguous`: a partial
+    // merge_insert that rewrites an INDEXED column in place drops the fragment from that
+    // index's coverage but leaves the old segment's entries (with the OLD values). Once an
+    // append re-index covers the fragment again, the scanner's mask (the union of every
+    // segment's coverage) admits those stale entries, so a filter on the OLD value matched a
+    // row whose stored value had changed. Each segment's hits must be restricted to its own
+    // coverage.
+    #[tokio::test]
+    async fn test_partial_merge_insert_then_append_reindex_serves_no_stale_values() {
+        let mut ds = create_indexed_3frag_dataset().await;
+        Arc::make_mut(&mut ds)
+            .create_index(
+                &["value_a"],
+                IndexType::BTree,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Fragment 1 holds value_a 100.0..200.0; rewrite it in place to 999.0.
+        let mut ds = partial_merge_insert(ds, 100..200, 999.0).await;
+        Arc::make_mut(&mut ds)
+            .optimize_indices(
+                &lance_index::optimize::OptimizeOptions::append()
+                    .index_names(vec!["value_a_idx".to_string()]),
+            )
+            .await
+            .unwrap();
+
+        let count = |filter: &'static str, use_index: bool| {
+            let ds = ds.clone();
+            async move {
+                let mut scan = ds.scan();
+                scan.filter(filter).unwrap().use_scalar_index(use_index);
+                scan.try_into_batch().await.unwrap().num_rows()
+            }
+        };
+        assert_eq!(
+            count("value_a = 150.0", false).await,
+            0,
+            "the stored value changed"
+        );
+        assert_eq!(
+            count("value_a = 150.0", true).await,
+            0,
+            "an index must not answer with a value the fragment no longer stores"
+        );
+        assert_eq!(count("value_a = 999.0", true).await, 100);
+        assert_eq!(count("value_a < 300.0", true).await, 200);
+    }
+
     // Regression test for GitHub issue #6877.
     //
     // Two sequential full-schema merge_insert UpdateAll calls against the same
