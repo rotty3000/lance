@@ -185,6 +185,45 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     Ok(())
 }
 
+/// The uuids of the segments of index `index_name` that still pin the oldest
+/// retained fragment reuse index (FRI) version, i.e. whose data has not been
+/// remapped through it ([`cleanup_frag_reuse_index`] cannot trim that version
+/// while any such segment exists).
+///
+/// Reads the raw manifest indexes, exactly as [`cleanup_frag_reuse_index`] does,
+/// and applies the same catch-up predicate, including its rule that a check
+/// which errors counts as not caught up. Returns an empty vector when the
+/// dataset has no FRI, the FRI retains no version, or no index is named
+/// `index_name`.
+pub async fn index_segments_not_caught_up(
+    dataset: &Dataset,
+    index_name: &str,
+) -> lance_core::Result<Vec<uuid::Uuid>> {
+    let indices = read_manifest_indexes(
+        &dataset.object_store,
+        &dataset.manifest_location,
+        &dataset.manifest,
+    )
+    .await?;
+    let Some(frag_reuse_index_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+    else {
+        return Ok(Vec::new());
+    };
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
+    // Versions are ordered oldest to newest.
+    let Some(oldest) = frag_reuse_details.versions.first() else {
+        return Ok(Vec::new());
+    };
+    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+
+    Ok(indices
+        .iter()
+        .filter(|idx| idx.name == index_name)
+        .filter(|idx| !is_index_remap_caught_up(oldest, idx, &chain_frag_bitmap).unwrap_or(false))
+        .map(|idx| idx.uuid)
+        .collect())
+}
+
 /// Every fragment the reuse chain touches (old + new) across all versions. An
 /// index disjoint from this set holds no row address the FRI remaps, so trimming
 /// can never strand it (fragment ids are never reused).
@@ -370,6 +409,125 @@ mod tests {
         // Bitmap still lists the removed fragment (not yet updated): retained.
         assert_false!(
             is_index_remap_caught_up(&version, &index_covering(5, &[7]), &chain).unwrap()
+        );
+    }
+
+    /// Two IVF_PQ segments; a deferred compaction rewrites only the older
+    /// segment's fragments, so exactly that segment pins the FRI until its data
+    /// is remapped.
+    #[tokio::test]
+    async fn segments_not_caught_up_after_a_deferred_rewrite() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let generator = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "vec",
+                    lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(16)),
+                )
+                .col("i", lance_datagen::array::step::<Int32Type>())
+        };
+        let params = |mode| {
+            Some(WriteParams {
+                mode,
+                max_rows_per_file: 2_000,
+                ..Default::default()
+            })
+        };
+
+        // Two small fragments (compactable together) become segment A.
+        let mut dataset = generator()
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(500),
+                Some(WriteParams {
+                    max_rows_per_file: 500,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                false,
+            )
+            .await
+            .unwrap();
+        // Two fragments already at the compaction target become segment B.
+        let mut dataset = generator()
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(2_000),
+                params(WriteMode::Append),
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("vec_idx").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        let segment_a = segments
+            .iter()
+            .find(|s| s.fragment_bitmap.as_ref().unwrap().contains(0))
+            .unwrap()
+            .uuid;
+
+        // No FRI yet: nothing pins anything.
+        assert!(
+            index_segments_not_caught_up(&dataset, "vec_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Fragments 0 and 1 (segment A) are rewritten; 2 and 3 are left alone.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 2_000,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            index_segments_not_caught_up(&dataset, "vec_idx")
+                .await
+                .unwrap(),
+            vec![segment_a]
+        );
+        // An unknown name has no segments.
+        assert!(
+            index_segments_not_caught_up(&dataset, "nope")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Remapping A over its new fragment catches it up.
+        remapping::remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+            .await
+            .unwrap();
+        assert!(
+            index_segments_not_caught_up(&dataset, "vec_idx")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 
