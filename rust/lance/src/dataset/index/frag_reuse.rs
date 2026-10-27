@@ -110,20 +110,16 @@ impl Dataset {
 /// [`remap_column_index`]: crate::dataset::optimize::remapping::remap_column_index
 pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Result<()> {
     // check against index metadata before auto-remap
-    let indices = read_manifest_indexes(
-        &dataset.object_store,
-        &dataset.manifest_location,
-        &dataset.manifest,
-    )
-    .await?;
-    let Some(frag_reuse_index_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+    let Some(FragReuseState {
+        indices,
+        frag_reuse_index_meta,
+        frag_reuse_details,
+        chain_frag_bitmap,
+    }) = read_frag_reuse_state(dataset).await?
     else {
         return Ok(());
     };
-
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-
-    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+    let frag_reuse_index_meta = &frag_reuse_index_meta;
 
     let mut retained_versions = Vec::new();
     let mut fragment_bitmaps = RoaringBitmap::new();
@@ -185,43 +181,70 @@ pub async fn cleanup_frag_reuse_index(dataset: &mut Dataset) -> lance_core::Resu
     Ok(())
 }
 
-/// The uuids of the segments of index `index_name` that still pin the oldest
-/// retained fragment reuse index (FRI) version, i.e. whose data has not been
-/// remapped through it ([`cleanup_frag_reuse_index`] cannot trim that version
-/// while any such segment exists).
+/// The uuids of the segments of index `index_name` that pin the fragment reuse
+/// index (FRI): those that have not caught up with at least one retained FRI
+/// version, i.e. whose data has not been remapped through it.
+/// [`cleanup_frag_reuse_index`] keeps a version while any index is behind it, so
+/// this is the set it is waiting for. A segment is listed once however many
+/// versions it is behind.
 ///
 /// Reads the raw manifest indexes, exactly as [`cleanup_frag_reuse_index`] does,
-/// and applies the same catch-up predicate, including its rule that a check
-/// which errors counts as not caught up. Returns an empty vector when the
-/// dataset has no FRI, the FRI retains no version, or no index is named
+/// and applies the same per-version catch-up predicate, including its rule that
+/// a check which errors counts as not caught up. Returns an empty vector when
+/// the dataset has no FRI, the FRI retains no version, or no index is named
 /// `index_name`.
 pub async fn index_segments_not_caught_up(
     dataset: &Dataset,
     index_name: &str,
 ) -> lance_core::Result<Vec<uuid::Uuid>> {
+    let Some(state) = read_frag_reuse_state(dataset).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(state
+        .indices
+        .iter()
+        .filter(|idx| idx.name == index_name)
+        .filter(|idx| {
+            state.frag_reuse_details.versions.iter().any(|version| {
+                !is_index_remap_caught_up(version, idx, &state.chain_frag_bitmap).unwrap_or(false)
+            })
+        })
+        .map(|idx| idx.uuid)
+        .collect())
+}
+
+/// What cleanup and [`index_segments_not_caught_up`] both start from.
+struct FragReuseState {
+    /// Every raw manifest index, the FRI itself included.
+    indices: Vec<IndexMetadata>,
+    frag_reuse_index_meta: IndexMetadata,
+    frag_reuse_details: Arc<FragReuseIndexDetails>,
+    chain_frag_bitmap: RoaringBitmap,
+}
+
+/// `None` when the dataset has no FRI.
+async fn read_frag_reuse_state(dataset: &Dataset) -> lance_core::Result<Option<FragReuseState>> {
     let indices = read_manifest_indexes(
         &dataset.object_store,
         &dataset.manifest_location,
         &dataset.manifest,
     )
     .await?;
-    let Some(frag_reuse_index_meta) = indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-    else {
-        return Ok(Vec::new());
-    };
-    let frag_reuse_details = load_frag_reuse_index_details(dataset, frag_reuse_index_meta).await?;
-    // Versions are ordered oldest to newest.
-    let Some(oldest) = frag_reuse_details.versions.first() else {
-        return Ok(Vec::new());
-    };
-    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
-
-    Ok(indices
+    let Some(frag_reuse_index_meta) = indices
         .iter()
-        .filter(|idx| idx.name == index_name)
-        .filter(|idx| !is_index_remap_caught_up(oldest, idx, &chain_frag_bitmap).unwrap_or(false))
-        .map(|idx| idx.uuid)
-        .collect())
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let frag_reuse_details = load_frag_reuse_index_details(dataset, &frag_reuse_index_meta).await?;
+    let chain_frag_bitmap = reuse_chain_frag_bitmap(&frag_reuse_details.versions);
+    Ok(Some(FragReuseState {
+        indices,
+        frag_reuse_index_meta,
+        frag_reuse_details,
+        chain_frag_bitmap,
+    }))
 }
 
 /// Every fragment the reuse chain touches (old + new) across all versions. An
@@ -529,6 +552,133 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A segment built between two deferred compactions is caught up with the
+    /// first reuse version but not the second; it must still be reported (the
+    /// oldest version alone would miss it, and cleanup keeps both versions).
+    #[tokio::test]
+    async fn segments_not_caught_up_judges_every_retained_version() {
+        use crate::dataset::{WriteMode, WriteParams};
+        use crate::index::vector::VectorIndexParams;
+        use lance_index::optimize::OptimizeOptions;
+        use lance_linalg::distance::MetricType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let generator = || {
+            lance_datagen::gen_batch()
+                .col(
+                    "vec",
+                    lance_datagen::array::rand_vec::<Float32Type>(Dimension::from(16)),
+                )
+                .col("i", lance_datagen::array::step::<Int32Type>())
+        };
+        let write = |mode, rows| {
+            Some(WriteParams {
+                mode,
+                max_rows_per_file: rows,
+                ..Default::default()
+            })
+        };
+        let compact = CompactionOptions {
+            target_rows_per_fragment: 2_000,
+            defer_index_remap: true,
+            ..Default::default()
+        };
+
+        // Segment A over two small fragments; two full fragments beside them.
+        generator()
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(500),
+                write(WriteMode::Create, 500),
+            )
+            .await
+            .unwrap();
+        let mut dataset = generator()
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(2_000),
+                write(WriteMode::Append, 2_000),
+            )
+            .await
+            .unwrap();
+        // One segment over all four fragments; the two full ones stay at the
+        // compaction target and are never rewritten.
+        dataset
+            .create_index(
+                &["vec"],
+                IndexType::Vector,
+                Some("vec_idx".into()),
+                &VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // First deferred compaction rewrites fragments 0 and 1, then the index
+        // is remapped through it: nothing is behind version one any more.
+        compact_files(&mut dataset, compact.clone(), None)
+            .await
+            .unwrap();
+        remapping::remap_column_index(&mut dataset, &["vec"], Some("vec_idx".into()))
+            .await
+            .unwrap();
+        assert!(
+            index_segments_not_caught_up(&dataset, "vec_idx")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Segment C is built over two new small fragments, after version one.
+        let mut dataset = generator()
+            .into_dataset_with_params(
+                uri,
+                FragmentCount::from(2),
+                FragmentRowCount::from(500),
+                write(WriteMode::Append, 500),
+            )
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+        let segments = dataset.load_indices_by_name("vec_idx").await.unwrap();
+        assert_eq!(segments.len(), 2);
+        let newest_fragment = dataset.get_fragments().last().unwrap().id() as u32;
+        let segment_c = segments
+            .iter()
+            .find(|s| {
+                s.fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(newest_fragment)
+            })
+            .unwrap()
+            .uuid;
+
+        // Second deferred compaction rewrites C's two fragments only.
+        compact_files(&mut dataset, compact, None).await.unwrap();
+        let state = read_frag_reuse_state(&dataset).await.unwrap().unwrap();
+        assert_eq!(state.frag_reuse_details.versions.len(), 2);
+        // Both are behind version two, neither is behind version one (the
+        // oldest-only check would report nothing). The first segment is listed
+        // too: remapped through version one it now covers version one's output
+        // fragment, which is in the reuse chain, and its stamp predates version
+        // two - the same conservative verdict cleanup uses to retain version two.
+        let mut behind = index_segments_not_caught_up(&dataset, "vec_idx")
+            .await
+            .unwrap();
+        behind.sort();
+        let mut expected = segments.iter().map(|s| s.uuid).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(behind, expected);
+        assert!(behind.contains(&segment_c));
     }
 
     #[tokio::test]
