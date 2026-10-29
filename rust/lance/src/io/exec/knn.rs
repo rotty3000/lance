@@ -263,6 +263,8 @@ pub struct KnnBatchParams {
     pub lower_bound: Option<f32>,
     pub upper_bound: Option<f32>,
     pub distance_type: DistanceType,
+    /// Keep the vector column in the output. When false, a batch or a
+    /// single-query node drops it right after scoring.
     pub retain_vector: bool,
 }
 
@@ -443,7 +445,9 @@ impl KNNVectorDistanceExec {
                 lower_bound: None,
                 upper_bound: None,
                 distance_type,
-                retain_vector: false,
+                // A single-query node keeps the vector unless asked not to
+                // (`Scanner::flat_knn_with`, knowdb #921).
+                retain_vector: true,
             },
         )
     }
@@ -497,7 +501,11 @@ impl KNNVectorDistanceExec {
             )));
         }
 
-        let stored_schema = if is_batch && !retain_vector {
+        // knowdb #921: a single-query node that does not retain the vector drops
+        // it right after scoring too, so a TopK above it holds `_rowid` +
+        // `_distance` (+ the other input columns) per kept row, never the vector:
+        // a deep exact page kept every row's vector and OOMed.
+        let stored_schema = if !retain_vector {
             Arc::new(Self::remove_vector_from_schema(&input_schema, column)?)
         } else {
             Arc::new(input_schema)
@@ -1019,6 +1027,7 @@ impl ExecutionPlan for KNNVectorDistanceExec {
         let column = self.column.clone();
         let dt = self.distance_type;
         let schema = self.schema();
+        let retain_vector = self.retain_vector;
 
         // Empty batches don't have a vector column to score; filter them out
         // before the transform so it always sees real work.
@@ -1044,6 +1053,13 @@ impl ExecutionPlan for KNNVectorDistanceExec {
                     elapsed_compute.add_duration(start.elapsed());
 
                     let _t = elapsed_compute.timer();
+                    // knowdb #921: an unretained vector is dropped before the
+                    // filter, so the filter never copies it.
+                    let batch = if retain_vector {
+                        batch
+                    } else {
+                        Self::remove_vector_from_batch(&batch, &column)?
+                    };
                     let distances = batch[DIST_COL].as_primitive::<Float32Type>();
                     let distance_values = distances.values();
                     let mask = BooleanArray::from_iter((0..distances.len()).map(|row_index| {

@@ -6441,7 +6441,9 @@ impl Scanner {
             if let Some(mask) = self.external_row_mask.clone() {
                 plan = Arc::new(RowAddrMaskFilterExec::new(plan, mask));
             }
-            Ok(self.flat_knn(plan, &q)?)
+            // knowdb #921: this flat search's output goes straight to the final
+            // projection, so an unprojected vector is dropped after scoring.
+            Ok(self.flat_knn_with(plan, &q, true)?)
         }
     }
 
@@ -7529,6 +7531,20 @@ impl Scanner {
 
     /// Add a knn search node to the input plan
     fn flat_knn(&self, input: Arc<dyn ExecutionPlan>, q: &Query) -> Result<Arc<dyn ExecutionPlan>> {
+        self.flat_knn_with(input, q, false)
+    }
+
+    /// knowdb #921: `flat_knn`, but when `drop_unprojected_vector` is set and the
+    /// query does not project the vector column, a single-query search drops it
+    /// right after scoring, so the top-k sort holds no vectors. Only a flat
+    /// search whose output goes straight to the final projection may set it (the
+    /// refine and `knn_combined` paths re-score their output from the vector).
+    fn flat_knn_with(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        q: &Query,
+        drop_unprojected_vector: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // Resolve metric_type if not set (use default for the column's element type)
         let metric_type = match q.metric_type {
             Some(m) => m,
@@ -7542,13 +7558,13 @@ impl Scanner {
         } else {
             input
         };
-        let retain_vector = if self.is_batch_nearest {
+        let retain_vector = if self.is_batch_nearest || drop_unprojected_vector {
             let vector_field_id = self.dataset.schema().field_id(q.column.as_str())?;
             self.projection_plan
                 .physical_projection
                 .contains_field_id(vector_field_id)
         } else {
-            false
+            true
         };
         let flat_dist = Arc::new(KNNVectorDistanceExec::try_new_batch(
             input,
@@ -10989,6 +11005,47 @@ mod test {
             batch_with_vec.schema().column_with_name("vec").is_some(),
             "batch flat KNN must include vector column when vec is projected"
         );
+    }
+
+    /// knowdb #921: a single-query flat search drops an unprojected vector
+    /// before its top-k sort, so the sort holds no vectors (a deep exact page
+    /// kept every row's vector and OOMed); a projected vector is kept.
+    #[tokio::test]
+    async fn test_single_knn_flat_sort_holds_no_unprojected_vector() {
+        let test_ds = TestVectorDataset::new(LanceFileVersion::Stable, true)
+            .await
+            .unwrap();
+        let dataset = &test_ds.dataset;
+        let query = Float32Array::from(vec![0.5f32; 32]);
+        let mut orders = Vec::new();
+        for (projection, keeps_vector) in [(vec!["i"], false), (vec!["i", "vec"], true)] {
+            let mut scan = dataset.scan();
+            scan.nearest("vec", &query, 5).unwrap();
+            scan.use_index(false);
+            scan.project(&projection).unwrap();
+            let plan = scan.create_plan().await.unwrap();
+            // A stream-sourced `LanceRead` hides its input from `children()`, so
+            // read the sort's schema off the rendered plan.
+            let rendered = format!(
+                "{}",
+                datafusion::physical_plan::displayable(plan.as_ref())
+                    .set_show_schema(true)
+                    .indent(true)
+            );
+            let sort = rendered
+                .lines()
+                .find(|l| l.contains("SortExec: TopK"))
+                .unwrap_or_else(|| panic!("a top-k sort: {rendered}"));
+            assert_eq!(
+                sort.contains("vec:"),
+                keeps_vector,
+                "{projection:?}: {sort}"
+            );
+            let batch = scan.try_into_batch().await.unwrap();
+            assert_eq!(batch.num_rows(), 5);
+            orders.push(batch["i"].as_primitive::<Int32Type>().values().to_vec());
+        }
+        assert_eq!(orders[0], orders[1], "same ranking either way");
     }
 
     #[tokio::test]
