@@ -105,6 +105,7 @@ use crate::index::frag_reuse::{load_frag_reuse_index_details, open_frag_reuse_in
 use crate::index::mem_wal::open_mem_wal_index;
 pub use crate::index::prefilter::{FilterLoader, PreFilter};
 use crate::index::scalar::{IndexDetails, fetch_index_details, load_training_data};
+pub use crate::index::scalar_logical::open_named_scalar_index;
 pub use crate::index::vector::{LogicalIvfView, LogicalVectorIndex};
 use crate::session::index_caches::{
     DerivedIndexListingKey, FragReuseIndexKey, IndexMetadataKey, write_index_identity,

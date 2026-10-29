@@ -621,6 +621,74 @@ mod tests {
         assert_eq!(combined_bitmap, dataset.fragment_bitmap.as_ref().clone());
     }
 
+    /// `open_named_scalar_index` is re-exported from `crate::index` (knowdb #979 phase 2 opens a
+    /// multi-segment BTree to build a row-address mask). Proves the export is public and that a
+    /// multi-segment `IsIn` returns `Exact` with each segment's hit. Per-segment coverage masking
+    /// of stale entries is NOT tested here; it is guarded by knowdb's
+    /// `lance_segment_coverage_911_test` tripwire.
+    #[tokio::test]
+    async fn named_scalar_index_is_public_and_unions_segment_hits() {
+        let test_dir = TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("value", array::step::<Int32Type>())
+            .into_dataset(
+                test_dir.as_str(),
+                FragmentCount::from(2),
+                FragmentRowCount::from(16),
+            )
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let fragments = dataset.get_fragments();
+        let mut segments = Vec::new();
+        for fragment in &fragments {
+            segments.push(
+                CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::BTree, &params)
+                    .name("value_btree_public".to_string())
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments("value_btree_public", "value", segments)
+            .await
+            .unwrap();
+
+        // Through the PUBLIC path, so the export is what is tested.
+        let index = crate::index::open_named_scalar_index(
+            &dataset,
+            "value",
+            "value_btree_public",
+            &NoOpMetricsCollector,
+        )
+        .await
+        .unwrap();
+        // 3 is in fragment 0, 20 is in fragment 1: one hit per segment.
+        let query = SargableQuery::IsIn(vec![
+            ScalarValue::Int32(Some(3)),
+            ScalarValue::Int32(Some(20)),
+        ]);
+        let SearchResult::Exact(rows) = index.search(&query, &NoOpMetricsCollector).await.unwrap()
+        else {
+            panic!("BTree search should be exact");
+        };
+        let addrs = rows
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            addrs,
+            BTreeSet::from([
+                u64::from(RowAddress::new_from_parts(fragments[0].id() as u32, 3)),
+                u64::from(RowAddress::new_from_parts(fragments[1].id() as u32, 4)),
+            ])
+        );
+    }
+
     #[tokio::test]
     async fn test_open_scalar_index_segments_keeps_partial_overlap() {
         let test_dir = TempStrDir::default();
