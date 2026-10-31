@@ -345,6 +345,18 @@ impl Session {
     pub async fn index_cache_stats(&self) -> lance_core::cache::CacheStats {
         self.index_cache.0.stats().await
     }
+
+    /// The index cache's weighted capacity in bytes, if its backend reports one.
+    pub fn index_cache_capacity_bytes(&self) -> Option<usize> {
+        self.index_cache.0.capacity_bytes()
+    }
+
+    /// Resize the index cache to `bytes`, evicting entries when it holds
+    /// more. Returns `false` when its backend cannot be resized (the default
+    /// quick_cache backend can).
+    pub fn set_index_cache_capacity_bytes(&self, bytes: usize) -> bool {
+        self.index_cache.0.set_capacity_bytes(bytes)
+    }
 }
 
 impl Default for Session {

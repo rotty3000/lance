@@ -8,7 +8,7 @@
 use super::PriorityEntries;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use futures::Future;
@@ -36,7 +36,8 @@ impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
 }
 
 pub struct QuickCacheBackend {
-    capacity: usize,
+    /// The weighted capacity, changed by [`CacheBackend::set_capacity_bytes`].
+    capacity: AtomicUsize,
     generation: AtomicU64,
     priority_active: AtomicBool,
     priority: Mutex<PriorityEntries<QuickEntry>>,
@@ -148,12 +149,16 @@ impl QuickCacheBackend {
         );
         Self {
             cache,
-            capacity,
+            capacity: AtomicUsize::new(capacity),
             generation: AtomicU64::new(0),
             priority_active: AtomicBool::new(false),
             priority: Mutex::new(PriorityEntries::default()),
         }
     }
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Acquire)
+    }
+
     fn admit_priority(
         &self,
         key: InternalCacheKey,
@@ -174,7 +179,7 @@ impl QuickCacheBackend {
                 let existing: Vec<_> = self.cache.iter().collect();
                 for (key, value) in existing {
                     let size = key_footprint(&key).saturating_add(value.size_bytes);
-                    dropped.extend(entries.insert(key, value, size, 3, self.capacity));
+                    dropped.extend(entries.insert(key, value, size, 3, self.capacity()));
                 }
                 // Evict resident values without invalidating single-flight
                 // placeholders: their loaders still belong to this generation.
@@ -186,7 +191,7 @@ impl QuickCacheBackend {
                 item,
                 size,
                 if priority == 0 { 3 } else { priority },
-                self.capacity,
+                self.capacity(),
             ));
             dropped
         };
@@ -301,7 +306,7 @@ impl CacheBackend for QuickCacheBackend {
             let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
             let dropped = entries.clear();
             self.priority_active.store(false, Ordering::Release);
-            self.cache.set_capacity(self.capacity as u64);
+            self.cache.set_capacity(self.capacity() as u64);
             dropped
         };
         drop(dropped);
@@ -327,7 +332,30 @@ impl CacheBackend for QuickCacheBackend {
     }
 
     fn capacity_bytes(&self) -> Option<usize> {
-        Some(self.capacity)
+        Some(self.capacity())
+    }
+
+    fn set_capacity_bytes(&self, bytes: usize) -> bool {
+        // Under the priority lock, so it orders with the switch into priority
+        // mode (`admit_priority`) and back out of it (`clear`), which both
+        // read the capacity there.
+        let dropped = {
+            let mut entries = self.priority.lock().unwrap_or_else(|e| e.into_inner());
+            self.capacity.store(bytes, Ordering::Release);
+            if self.priority_active.load(Ordering::Acquire) {
+                // Priority mode keeps every resident value in `priority` and
+                // quick_cache at zero; evict the lowest priorities down to it.
+                entries.shrink_to(bytes)
+            } else {
+                // quick_cache splits the capacity evenly across the shards and
+                // evicts down to it; the shard count stays the one chosen at
+                // construction.
+                self.cache.set_capacity(bytes as u64);
+                Vec::new()
+            }
+        };
+        drop(dropped);
+        true
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -917,5 +945,81 @@ mod tests {
                 .await
                 .is_some();
         assert!(hit, "recently inserted entries should be resident");
+    }
+
+    #[tokio::test]
+    async fn test_quick_backend_resizes_and_evicts_down() {
+        // A resize changes the reported capacity, evicts down to a smaller
+        // one, and lets the cache hold more after it grows again.
+        const CAPACITY: usize = 256 << 10;
+        let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(CAPACITY)));
+        let fill = |n: usize| {
+            let cache = &cache;
+            async move {
+                for i in 0..n {
+                    cache
+                        .insert_with_key(
+                            &TestKey::<Vec<u8>>::new(&format!("k-{i}")),
+                            Arc::new(vec![0u8; 4 << 10]),
+                        )
+                        .await;
+                }
+            }
+        };
+        fill(48).await;
+        let full = cache.size_bytes().await;
+        assert!(full > 128 << 10, "premise: the cache holds over 128 KiB");
+
+        assert!(cache.set_capacity_bytes(64 << 10));
+        assert_eq!(cache.capacity_bytes(), Some(64 << 10));
+        assert!(
+            cache.size_bytes().await <= 64 << 10,
+            "a smaller capacity evicts down to it"
+        );
+
+        assert!(cache.set_capacity_bytes(CAPACITY));
+        assert_eq!(cache.capacity_bytes(), Some(CAPACITY));
+        fill(48).await;
+        assert!(
+            cache.size_bytes().await > 64 << 10,
+            "a larger capacity holds more again"
+        );
+        assert!(cache.size_bytes().await <= CAPACITY);
+    }
+
+    /// knowdb #1011 on v14: a resize while the backend is in priority mode
+    /// (quick_cache held at zero, every value in the priority tier) evicts the
+    /// lowest priorities down to the new budget, and `clear` restores the
+    /// ordinary budget at the resized capacity.
+    #[tokio::test]
+    async fn test_quick_backend_resizes_in_priority_mode() {
+        let cache = QuickCacheBackend::with_capacity(160);
+        let key = |id| InternalCacheKey::from_bytes([id; 16]);
+        let codec = CacheCodec::new("test.priority", 1, |_, _| Ok(()), |_| Ok(Arc::new(())));
+        for (id, priority) in [(1, 3), (2, 2)] {
+            cache
+                .insert(
+                    &key(id),
+                    Arc::new(id),
+                    32,
+                    Some(codec.with_memory_priority(priority)),
+                )
+                .await;
+        }
+        assert!(cache.get_resident(&key(1)).await.is_some());
+        assert!(cache.get_resident(&key(2)).await.is_some());
+
+        let one_entry = cache.size_bytes().await / 2;
+        assert!(cache.set_capacity_bytes(one_entry));
+        assert_eq!(cache.capacity_bytes(), Some(one_entry));
+        assert!(cache.size_bytes().await <= one_entry);
+        assert!(
+            cache.get_resident(&key(2)).await.is_none(),
+            "the lower priority is evicted first"
+        );
+        assert!(cache.get_resident(&key(1)).await.is_some());
+
+        cache.clear().await;
+        assert_eq!(cache.capacity_bytes(), Some(one_entry));
     }
 }

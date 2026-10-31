@@ -88,6 +88,20 @@ impl<T: Clone> PriorityEntries<T> {
         }
         dropped
     }
+    /// Evict the lowest-priority, oldest entries until at most `capacity`
+    /// bytes remain, returning what was dropped.
+    pub fn shrink_to(&mut self, capacity: usize) -> Vec<T> {
+        let mut dropped = Vec::new();
+        while self.bytes > capacity as u128 {
+            let Some(key) = self.order.first_key_value().map(|(_, key)| *key) else {
+                break;
+            };
+            if let Some(value) = self.remove(&key) {
+                dropped.push(value);
+            }
+        }
+        dropped
+    }
     pub fn clear(&mut self) -> Vec<T> {
         self.order.clear();
         self.bytes = 0;
