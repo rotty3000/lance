@@ -34,7 +34,8 @@ impl quick_cache::Weighter<InternalCacheKey, QuickEntry> for EntryWeighter {
 
 pub struct QuickCacheBackend {
     cache: quick_cache::sync::Cache<InternalCacheKey, QuickEntry, EntryWeighter>,
-    capacity: usize,
+    /// The weighted capacity, changed by [`CacheBackend::set_capacity_bytes`].
+    capacity: std::sync::atomic::AtomicUsize,
 }
 
 /// Controls how a [`QuickCacheBackend`] divides its weight budget.
@@ -140,7 +141,10 @@ impl QuickCacheBackend {
             Default::default(),
             Default::default(),
         );
-        Self { cache, capacity }
+        Self {
+            cache,
+            capacity: std::sync::atomic::AtomicUsize::new(capacity),
+        }
     }
 
     #[cfg(test)]
@@ -202,7 +206,16 @@ impl CacheBackend for QuickCacheBackend {
     }
 
     fn capacity_bytes(&self) -> Option<usize> {
-        Some(self.capacity)
+        Some(self.capacity.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    fn set_capacity_bytes(&self, bytes: usize) -> bool {
+        // quick_cache splits the capacity evenly across the shards and evicts
+        // down to it; the shard count stays the one chosen at construction.
+        self.cache.set_capacity(bytes as u64);
+        self.capacity
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     fn approx_num_entries(&self) -> usize {
@@ -603,5 +616,45 @@ mod tests {
                 .await
                 .is_some();
         assert!(hit, "recently inserted entries should be resident");
+    }
+
+    #[tokio::test]
+    async fn test_quick_backend_resizes_and_evicts_down() {
+        // A resize changes the reported capacity, evicts down to a smaller
+        // one, and lets the cache hold more after it grows again.
+        const CAPACITY: usize = 256 << 10;
+        let cache = LanceCache::with_backend(Arc::new(QuickCacheBackend::with_capacity(CAPACITY)));
+        let fill = |n: usize| {
+            let cache = &cache;
+            async move {
+                for i in 0..n {
+                    cache
+                        .insert_with_key(
+                            &TestKey::<Vec<u8>>::new(&format!("k-{i}")),
+                            Arc::new(vec![0u8; 4 << 10]),
+                        )
+                        .await;
+                }
+            }
+        };
+        fill(48).await;
+        let full = cache.size_bytes().await;
+        assert!(full > 128 << 10, "premise: the cache holds over 128 KiB");
+
+        assert!(cache.set_capacity_bytes(64 << 10));
+        assert_eq!(cache.capacity_bytes(), Some(64 << 10));
+        assert!(
+            cache.size_bytes().await <= 64 << 10,
+            "a smaller capacity evicts down to it"
+        );
+
+        assert!(cache.set_capacity_bytes(CAPACITY));
+        assert_eq!(cache.capacity_bytes(), Some(CAPACITY));
+        fill(48).await;
+        assert!(
+            cache.size_bytes().await > 64 << 10,
+            "a larger capacity holds more again"
+        );
+        assert!(cache.size_bytes().await <= CAPACITY);
     }
 }

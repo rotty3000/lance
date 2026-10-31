@@ -124,6 +124,14 @@ pub trait CacheBackend: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// Change the weighted capacity to `bytes`, evicting entries when the
+    /// cache holds more than the new capacity. Returns `false` when the
+    /// backend cannot be resized (the default), in which case nothing
+    /// changes.
+    fn set_capacity_bytes(&self, _bytes: usize) -> bool {
+        false
+    }
+
     /// Computes the size of the entries currently held in memory.
     ///
     /// `size_of_entry` threads a shared [`Context`] through each value so

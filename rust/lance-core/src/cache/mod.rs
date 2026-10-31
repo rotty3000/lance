@@ -340,6 +340,12 @@ impl LanceCache {
         self.state.backend.capacity_bytes()
     }
 
+    /// Change the weighted capacity to `bytes`, evicting entries when the
+    /// cache holds more. Returns `false` when the backend cannot be resized.
+    pub fn set_capacity_bytes(&self, bytes: usize) -> bool {
+        self.state.backend.set_capacity_bytes(bytes)
+    }
+
     // -- Stats / clear --------------------------------------------------------
 
     pub async fn stats(&self) -> CacheStats {
