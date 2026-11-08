@@ -895,16 +895,33 @@ impl CoreFieldDecoderStrategy {
         field: &Field,
         column_infos: &mut ColumnInfoIter,
     ) -> Result<Box<dyn StructuralFieldScheduler>> {
+        self.create_scaled_structural_field_scheduler(field, column_infos, 1)
+    }
+
+    /// `row_scale` is how many of the field's rows make one top-level row:
+    /// the product of the dimensions of every fixed-size list of structs above
+    /// it, whose scheduler multiplies its children's row ranges by its
+    /// dimension. A leaf's page schedulers divide it out to give each read the
+    /// top-level row it is for as its I/O priority (knowdb #1059).
+    fn create_scaled_structural_field_scheduler(
+        &self,
+        field: &Field,
+        column_infos: &mut ColumnInfoIter,
+        row_scale: u64,
+    ) -> Result<Box<dyn StructuralFieldScheduler>> {
         let data_type = field.data_type();
         validate_fixed_size_list_dimensions(&field.name, &data_type)?;
         if Self::is_structural_primitive(&data_type) {
             let column_info = column_infos.expect_next()?;
-            let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                column_info.clone(),
-                self.decompressor_strategy.clone(),
-                self.cache_repetition_index,
-                field,
-            )?);
+            let scheduler = Box::new(
+                StructuralPrimitiveFieldScheduler::try_new_lazy(
+                    column_info.clone(),
+                    self.decompressor_strategy.clone(),
+                    self.cache_repetition_index,
+                    field,
+                )?
+                .with_row_scale(row_scale),
+            );
 
             // advance to the next top level column
             column_infos.next_top_level();
@@ -916,12 +933,15 @@ impl CoreFieldDecoderStrategy {
                 if field.is_packed_struct() {
                     // Packed struct
                     let column_info = column_infos.expect_next()?;
-                    let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                        column_info.clone(),
-                        self.decompressor_strategy.clone(),
-                        self.cache_repetition_index,
-                        field,
-                    )?);
+                    let scheduler = Box::new(
+                        StructuralPrimitiveFieldScheduler::try_new_lazy(
+                            column_info.clone(),
+                            self.decompressor_strategy.clone(),
+                            self.cache_repetition_index,
+                            field,
+                        )?
+                        .with_row_scale(row_scale),
+                    );
 
                     // advance to the next top level column
                     column_infos.next_top_level();
@@ -940,12 +960,15 @@ impl CoreFieldDecoderStrategy {
                         )
                     }) {
                         let column_info = column_infos.expect_next()?;
-                        let scheduler = Box::new(StructuralPrimitiveFieldScheduler::try_new_lazy(
-                            column_info.clone(),
-                            self.decompressor_strategy.clone(),
-                            self.cache_repetition_index,
-                            field,
-                        )?);
+                        let scheduler = Box::new(
+                            StructuralPrimitiveFieldScheduler::try_new_lazy(
+                                column_info.clone(),
+                                self.decompressor_strategy.clone(),
+                                self.cache_repetition_index,
+                                field,
+                            )?
+                            .with_row_scale(row_scale),
+                        );
                         column_infos.next_top_level();
                         return Ok(scheduler);
                     }
@@ -953,8 +976,11 @@ impl CoreFieldDecoderStrategy {
 
                 let mut child_schedulers = Vec::with_capacity(field.children.len());
                 for field in field.children.iter() {
-                    let field_scheduler =
-                        self.create_structural_field_scheduler(field, column_infos)?;
+                    let field_scheduler = self.create_scaled_structural_field_scheduler(
+                        field,
+                        column_infos,
+                        row_scale,
+                    )?;
                     child_schedulers.push(field_scheduler);
                 }
 
@@ -967,7 +993,7 @@ impl CoreFieldDecoderStrategy {
             DataType::List(_) | DataType::LargeList(_) => {
                 let child = field.children.first().expect_ok()?;
                 let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                    self.create_scaled_structural_field_scheduler(child, column_infos, row_scale)?;
                 Ok(Box::new(StructuralListScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -975,8 +1001,13 @@ impl CoreFieldDecoderStrategy {
                 if matches!(inner.data_type(), DataType::Struct(_)) =>
             {
                 let child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(child, column_infos)?;
+                // `validate_fixed_size_list_dimensions` rejected a dimension below 1.
+                let child_row_scale = row_scale.saturating_mul(*dimension as u64);
+                let child_scheduler = self.create_scaled_structural_field_scheduler(
+                    child,
+                    column_infos,
+                    child_row_scale,
+                )?;
                 Ok(Box::new(StructuralFixedSizeListScheduler::new(
                     child_scheduler,
                     *dimension,
@@ -990,8 +1021,11 @@ impl CoreFieldDecoderStrategy {
                     return Err(Error::not_supported_source(format!("Map data type is not supported with keys_sorted=true now, current value is {}", *keys_sorted).into()));
                 }
                 let entries_child = field.children.first().expect_ok()?;
-                let child_scheduler =
-                    self.create_structural_field_scheduler(entries_child, column_infos)?;
+                let child_scheduler = self.create_scaled_structural_field_scheduler(
+                    entries_child,
+                    column_infos,
+                    row_scale,
+                )?;
                 Ok(Box::new(StructuralMapScheduler::new(child_scheduler))
                     as Box<dyn StructuralFieldScheduler>)
             }
@@ -3482,7 +3516,9 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
-    use arrow_array::StringArray;
+    use arrow_array::{
+        Array, FixedSizeListArray, Float32Array, Int32Array, StringArray, StructArray,
+    };
     use std::collections::VecDeque;
 
     struct StaticArrayDecodeTask(ArrayRef);
@@ -4214,5 +4250,210 @@ mod tests {
                 "third batch should be near 50 rows, got {third_batch_rows}"
             );
         }
+    }
+
+    /// Serves an in-memory buffer and records the priority of every request.
+    #[derive(Debug)]
+    struct PriorityRecorder {
+        inner: BufferScheduler,
+        priorities: Mutex<Vec<u64>>,
+    }
+
+    impl EncodingsIo for PriorityRecorder {
+        fn submit_request(
+            &self,
+            ranges: Vec<Range<u64>>,
+            priority: u64,
+        ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+            self.priorities.lock().unwrap().push(priority);
+            self.inner.submit_request(ranges, priority)
+        }
+    }
+
+    /// Encodes `array` as the only column and reads `ranges` of it. Returns the
+    /// layout of the leaf column's single page and the priority of every read
+    /// made for the rows (page initialization is done before recording).
+    async fn read_priorities(
+        array: ArrayRef,
+        ranges: &[Range<u64>],
+        cache_repetition_index: bool,
+    ) -> (&'static str, Vec<u64>) {
+        use crate::{
+            encoder::{EncodingOptions, encode_batch},
+            testing::{TestEncoding, test_encoding_strategy},
+        };
+        use metadata::page_layout::Layout;
+
+        // StructuralU32 enables FixedSizeList<Struct>.
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "c",
+            array.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+        let encoded = encode_batch(
+            &batch,
+            Arc::new(Schema::try_from(schema.as_ref()).unwrap()),
+            test_encoding_strategy(TestEncoding::StructuralU32).as_ref(),
+            &EncodingOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(encoded.page_table.len(), 1, "one leaf column");
+        let pages = &encoded.page_table[0].page_infos;
+        assert_eq!(pages.len(), 1, "one page");
+        let layout = match &pages[0].encoding {
+            PageEncoding::Structural(metadata::PageLayout {
+                layout: Some(Layout::MiniBlockLayout(_)),
+            }) => "mini-block",
+            PageEncoding::Structural(metadata::PageLayout {
+                layout: Some(Layout::FullZipLayout(_)),
+            }) if pages[0].buffer_offsets_and_sizes.len() > 1 => "full-zip rep",
+            PageEncoding::Structural(metadata::PageLayout {
+                layout: Some(Layout::FullZipLayout(_)),
+            }) => "full-zip simple",
+            other => panic!("unexpected page encoding {other:?}"),
+        };
+
+        let io = Arc::new(PriorityRecorder {
+            inner: BufferScheduler::new(encoded.data.clone()),
+            priorities: Mutex::default(),
+        });
+        let filter = FilterExpression::no_filter();
+        let mut decode_scheduler = DecodeBatchScheduler::try_new(
+            encoded.schema.as_ref(),
+            &encoded.top_level_columns,
+            &encoded.page_table,
+            &vec![],
+            encoded.num_rows,
+            Arc::new(DecoderPlugins::default()),
+            io.clone(),
+            Arc::new(LanceCache::with_capacity(128 * 1024 * 1024)),
+            &filter,
+            &DecoderConfig {
+                cache_repetition_index,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        io.priorities.lock().unwrap().clear();
+
+        let num_rows = ranges.iter().map(|range| range.end - range.start).sum();
+        let (tx, rx) = unbounded_channel();
+        decode_scheduler.schedule_ranges(ranges, &filter, tx, io.clone());
+        let mut decode_stream = create_decode_stream(
+            &encoded.schema,
+            num_rows,
+            num_rows as u32,
+            /*is_structural=*/ true,
+            /*should_validate=*/ true,
+            /*spawn_structural_batch_decode_tasks=*/ true,
+            rx,
+            None,
+        )
+        .unwrap();
+        let mut rows_read = 0;
+        while let Some(task) = decode_stream.next().await {
+            rows_read += task.task.await.unwrap().num_rows() as u64;
+        }
+        assert_eq!(rows_read, num_rows);
+        let priorities = io.priorities.lock().unwrap().clone();
+        (layout, priorities)
+    }
+
+    /// knowdb #1059: every page read carries the first top-level row it is
+    /// for, at each patched site (mini-block, full-zip with a repetition index,
+    /// cached and not, and full-zip without), including beneath a fixed-size
+    /// list of structs, whose leaf pages count `dimension` rows per top-level
+    /// row.
+    #[tokio::test]
+    async fn test_read_priority_is_first_requested_top_level_row() {
+        const ROWS: usize = 1000;
+        const FIRST_ROW: u64 = 300;
+        // Plain columns hold `ROWS` values; beneath an FSL<Struct> of
+        // dimension d the leaf holds `ROWS * d`.
+        let ints =
+            |n: usize| Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())) as ArrayRef;
+        let vectors = |n: usize| {
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::new(ArrowField::new("item", DataType::Float32, false)),
+                    128,
+                    Arc::new(Float32Array::from(
+                        (0..n * 128).map(|v| v as f32).collect::<Vec<_>>(),
+                    )),
+                    None,
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        let strings = |n: usize| {
+            // 300 bytes a value: too wide for mini-block.
+            Arc::new(StringArray::from(
+                (0..n).map(|i| format!("{i:0>300}")).collect::<Vec<_>>(),
+            )) as ArrayRef
+        };
+        let fsl_of_struct = |child: ArrayRef, dimension: i32| {
+            let item = StructArray::from(vec![(
+                Arc::new(ArrowField::new("v", child.data_type().clone(), false)),
+                child,
+            )]);
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::new(ArrowField::new("item", item.data_type().clone(), false)),
+                    dimension,
+                    Arc::new(item),
+                    None,
+                )
+                .unwrap(),
+            ) as ArrayRef
+        };
+        let cases = [
+            ("int32", ints(ROWS), "mini-block"),
+            ("vector", vectors(ROWS), "full-zip simple"),
+            ("string", strings(ROWS), "full-zip rep"),
+            (
+                "fsl<struct<int32>, 4>",
+                fsl_of_struct(ints(ROWS * 4), 4),
+                "mini-block",
+            ),
+            (
+                "fsl<struct<vector>, 2>",
+                fsl_of_struct(vectors(ROWS * 2), 2),
+                "full-zip simple",
+            ),
+            (
+                "fsl<struct<string>, 3>",
+                fsl_of_struct(strings(ROWS * 3), 3),
+                "full-zip rep",
+            ),
+        ];
+        let requests = [
+            vec![FIRST_ROW..FIRST_ROW + 5],
+            vec![FIRST_ROW..FIRST_ROW + 5, 700..702],
+        ];
+        let mut failures = Vec::new();
+        for (name, array, expected_layout) in cases {
+            for ranges in &requests {
+                for cache_repetition_index in [false, true] {
+                    let (layout, priorities) =
+                        read_priorities(array.clone(), ranges, cache_repetition_index).await;
+                    let case = format!(
+                        "{name} {ranges:?} cache_repetition_index={cache_repetition_index}"
+                    );
+                    assert_eq!(layout, expected_layout, "{case}");
+                    assert!(!priorities.is_empty(), "{case}: no reads recorded");
+                    if priorities.iter().any(|priority| *priority != FIRST_ROW) {
+                        failures.push(format!("{case} ({layout}): {priorities:?}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "every read must carry the first requested top-level row {FIRST_ROW}:\n{}",
+            failures.join("\n")
+        );
     }
 }

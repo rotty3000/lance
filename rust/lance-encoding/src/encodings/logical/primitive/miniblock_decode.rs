@@ -827,6 +827,9 @@ pub struct MiniBlockScheduler {
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
     has_large_chunk: bool,
+    /// Page rows per top-level row: above 1 only beneath a fixed-size list of
+    /// structs. Divided out of a read's first row to give its I/O priority.
+    pub(super) row_scale: u64,
 }
 
 impl MiniBlockScheduler {
@@ -917,6 +920,7 @@ impl MiniBlockScheduler {
             def_meaning: def_meaning.into(),
             page_meta: None,
             has_large_chunk: layout.has_large_chunk,
+            row_scale: 1,
         })
     }
 
@@ -1557,8 +1561,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data =
-            io.submit_request(chunk_ranges, super::request_priority(self.priority, ranges));
+        let loaded_chunk_data = io.submit_request(
+            chunk_ranges,
+            super::request_priority(self.priority, ranges, self.row_scale),
+        );
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();

@@ -398,7 +398,8 @@ impl CacheKey for PageDataCacheKey {
 const MINIBLOCK_ALIGNMENT: usize = 8;
 
 /// The I/O priority of a read of `ranges` (ordered rows, relative to the page)
-/// from a page whose first row is `page_priority`.
+/// from a page whose first row is `page_priority`, with `row_scale` page rows
+/// per top-level row.
 ///
 /// A read is prioritized by the first row it is for, not by its page's first
 /// row. Past an exhausted byte budget the I/O scheduler admits only a request
@@ -412,10 +413,14 @@ const MINIBLOCK_ALIGNMENT: usize = 8;
 /// sibling first, so the admitted read was never consumed, its bytes never
 /// came back, and the read hung with no I/O in flight (knowdb #1059).
 ///
-/// Rows beneath a fixed-size list of structs count child rows, which this does
-/// not rescale, like the blob page scheduler's priority.
-fn request_priority(page_priority: u64, ranges: &[Range<u64>]) -> u64 {
-    page_priority.saturating_add(ranges.first().map_or(0, |range| range.start))
+/// `PageInfo.priority` counts top-level rows, but beneath a fixed-size list
+/// of structs a page counts child rows (`row_scale` per top-level row). The
+/// offset is divided by `row_scale` so it counts top-level rows too: an
+/// offset left in child rows overshoots past a sibling's page boundary, and
+/// that order inversion is the same deadlock.
+fn request_priority(page_priority: u64, ranges: &[Range<u64>], row_scale: u64) -> u64 {
+    let offset = ranges.first().map_or(0, |range| range.start) / row_scale.max(1);
+    page_priority.saturating_add(offset)
 }
 
 #[cfg(test)]

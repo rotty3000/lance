@@ -158,6 +158,9 @@ pub struct StructuralPrimitiveFieldScheduler {
     page_source: Option<PageSchedulerSource>,
     column_index: u32,
     target_data_type_tag: Arc<str>,
+    /// Column rows per top-level row, passed to every page scheduler built
+    /// (see [`Self::with_row_scale`]).
+    row_scale: u64,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -191,6 +194,7 @@ impl StructuralPrimitiveFieldScheduler {
                 decompressors,
                 cache_repetition_index,
                 target_field,
+                1,
             )?);
             row_start = row_end;
         }
@@ -200,6 +204,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_source: None,
             column_index: column_info.index,
             target_data_type_tag: format!("{:?}", target_field.data_type()).into(),
+            row_scale: 1,
         })
     }
 
@@ -226,7 +231,21 @@ impl StructuralPrimitiveFieldScheduler {
                 cache_repetition_index,
                 target_field: target_field.clone(),
             }),
+            row_scale: 1,
         })
+    }
+
+    /// Sets how many of this column's rows make one top-level row. It is above
+    /// 1 only beneath a fixed-size list of structs, whose scheduler multiplies
+    /// the row ranges it hands down by its dimension; the page schedulers built
+    /// afterwards divide it out of their reads' I/O priorities (knowdb #1059).
+    pub fn with_row_scale(mut self, row_scale: u64) -> Self {
+        debug_assert!(
+            self.page_schedulers.is_empty(),
+            "the row scale must be set before any page scheduler is built"
+        );
+        self.row_scale = row_scale;
+        self
     }
 
     /// Exclusive end row of every page of `column_info`, in page order.
@@ -265,6 +284,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_source: None,
             column_index,
             target_data_type_tag,
+            row_scale: 1,
         }
     }
 
@@ -320,6 +340,7 @@ impl StructuralPrimitiveFieldScheduler {
                     source.decompressors.as_ref(),
                     source.cache_repetition_index,
                     &source.target_field,
+                    self.row_scale,
                 )?);
             }
             if !missing.is_empty() {
@@ -351,16 +372,21 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        row_scale: u64,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use metadata::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
-            Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
-                &page_info.buffer_offsets_and_sizes,
-                page_info.priority,
-                mini_block.num_items,
-                mini_block,
-                decompressors,
-            )?),
+            Layout::MiniBlockLayout(mini_block) => {
+                let mut scheduler = MiniBlockScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    mini_block.num_items,
+                    mini_block,
+                    decompressors,
+                )?;
+                scheduler.row_scale = row_scale;
+                Box::new(scheduler)
+            }
             Layout::FullZipLayout(full_zip) => {
                 let mut scheduler = FullZipScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -370,6 +396,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                 )?;
                 scheduler.enable_cache = cache_repetition_index;
+                scheduler.row_scale = row_scale;
                 Box::new(scheduler)
             }
             Layout::ConstantLayout(constant_layout) => {
@@ -421,6 +448,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    row_scale,
                 )?;
                 let def_meaning = blob
                     .layers
@@ -439,6 +467,7 @@ impl StructuralPrimitiveFieldScheduler {
                         inner_scheduler,
                         page_info.priority,
                         page_info.num_rows,
+                        row_scale,
                         def_meaning.into(),
                     ))
                 }
@@ -453,6 +482,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        row_scale: u64,
     ) -> Result<PageInfoAndScheduler> {
         if let PageEncoding::Planar(layout) = &page_info.encoding {
             let scheduler = if layout.sparse().is_some() {
@@ -470,6 +500,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    row_scale,
                 )?
             };
             return Ok(PageInfoAndScheduler {
@@ -485,6 +516,7 @@ impl StructuralPrimitiveFieldScheduler {
             decompressors,
             cache_repetition_index,
             target_field,
+            row_scale,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,

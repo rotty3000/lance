@@ -237,6 +237,9 @@ pub(super) struct BlobPageScheduler {
     inner_scheduler: Box<dyn StructuralPageScheduler>,
     row_number: u64,
     num_rows: u64,
+    /// Page rows per top-level row (above 1 beneath a fixed-size list of
+    /// structs); divided out of a read's first row for its I/O priority.
+    row_scale: u64,
     def_meaning: Arc<[DefinitionInterpretation]>,
     positions: Option<Arc<UInt64Array>>,
     sizes: Option<Arc<UInt64Array>>,
@@ -247,12 +250,14 @@ impl BlobPageScheduler {
         inner_scheduler: Box<dyn StructuralPageScheduler>,
         row_number: u64,
         num_rows: u64,
+        row_scale: u64,
         def_meaning: Arc<[DefinitionInterpretation]>,
     ) -> Self {
         Self {
             inner_scheduler,
             row_number,
             num_rows,
+            row_scale,
             def_meaning,
             positions: None,
             sizes: None,
@@ -378,7 +383,7 @@ impl StructuralPageScheduler for BlobPageScheduler {
         for range in ranges {
             for row in range.start..range.end {
                 if first_row_number.is_none() {
-                    first_row_number = Some(row + self.row_number);
+                    first_row_number = Some(row / self.row_scale.max(1) + self.row_number);
                 }
                 let position = positions.value(row as usize);
                 let size = sizes.value(row as usize);

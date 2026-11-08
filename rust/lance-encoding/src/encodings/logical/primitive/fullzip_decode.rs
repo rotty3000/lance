@@ -147,6 +147,9 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     pub(super) enable_cache: bool,
+    /// Page rows per top-level row: above 1 only beneath a fixed-size list of
+    /// structs. Divided out of a read's first row to give its I/O priority.
+    pub(super) row_scale: u64,
 }
 
 impl FullZipScheduler {
@@ -229,6 +232,7 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         })
     }
 
@@ -385,7 +389,7 @@ impl FullZipScheduler {
     ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let data_buf_position = self.data_buf_position;
-        let priority = super::request_priority(self.priority, ranges);
+        let priority = super::request_priority(self.priority, ranges, self.row_scale);
         let details = self.details.clone();
         let bits_per_offset = self.bits_per_offset;
 
@@ -491,7 +495,7 @@ impl FullZipScheduler {
             .collect::<Vec<_>>();
 
         let io_future =
-            io.submit_request(byte_ranges, super::request_priority(self.priority, ranges));
+            io.submit_request(byte_ranges, super::request_priority(self.priority, ranges, self.row_scale));
         let page_load_task = Self::create_page_load_task(
             io_future,
             num_rows,
@@ -1653,6 +1657,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1779,6 +1784,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -1904,6 +1910,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
