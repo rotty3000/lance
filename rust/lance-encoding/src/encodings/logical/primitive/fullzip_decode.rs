@@ -385,7 +385,7 @@ impl FullZipScheduler {
     ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let data_buf_position = self.data_buf_position;
-        let priority = self.priority;
+        let priority = super::request_priority(self.priority, ranges);
         let details = self.details.clone();
         let bits_per_offset = self.bits_per_offset;
 
@@ -490,7 +490,8 @@ impl FullZipScheduler {
             })
             .collect::<Vec<_>>();
 
-        let io_future = io.submit_request(byte_ranges, self.priority);
+        let io_future =
+            io.submit_request(byte_ranges, super::request_priority(self.priority, ranges));
         let page_load_task = Self::create_page_load_task(
             io_future,
             num_rows,

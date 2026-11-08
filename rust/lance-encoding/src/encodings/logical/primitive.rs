@@ -397,6 +397,27 @@ impl CacheKey for PageDataCacheKey {
 // the page" and "aligned to 8 bytes from the start of the file."
 const MINIBLOCK_ALIGNMENT: usize = 8;
 
+/// The I/O priority of a read of `ranges` (ordered rows, relative to the page)
+/// from a page whose first row is `page_priority`.
+///
+/// A read is prioritized by the first row it is for, not by its page's first
+/// row. Past an exhausted byte budget the I/O scheduler admits only a request
+/// at or below the lowest priority in flight, or one equal to an admitted
+/// priority, and that avoids deadlock only while reads are consumed in
+/// priority order. The decoder awaits the pages of a scan line one after
+/// another, so they must share one priority. Tagged with their page starts, a
+/// read deep inside a long page of one column got that page's much lower
+/// start, was admitted first, and held the lowest in-flight priority below its
+/// sibling from a column whose page starts later. The decoder awaited the
+/// sibling first, so the admitted read was never consumed, its bytes never
+/// came back, and the read hung with no I/O in flight (knowdb #1059).
+///
+/// Rows beneath a fixed-size list of structs count child rows, which this does
+/// not rescale, like the blob page scheduler's priority.
+fn request_priority(page_priority: u64, ranges: &[Range<u64>]) -> u64 {
+    page_priority.saturating_add(ranges.first().map_or(0, |range| range.start))
+}
+
 #[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {

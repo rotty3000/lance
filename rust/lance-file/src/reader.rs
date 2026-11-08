@@ -2517,7 +2517,11 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::metadata,
     };
-    use lance_io::{scheduler::IoStats, stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        scheduler::{IoStats, ScanScheduler, SchedulerConfig},
+        stream::RecordBatchStream,
+        utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -5340,5 +5344,151 @@ mod tests {
             9
         );
         assert_eq!(validate(empty_struct, true, &[0], vec![9]).unwrap(), 9);
+    }
+
+    /// knowdb #1059: a read that starts deep inside one column's page must not
+    /// deadlock the I/O scheduler's byte budget.
+    ///
+    /// `id` has one page starting at row 0; `vector` has many pages. A read
+    /// of rows starting mid-way through a later `vector` page splits one
+    /// scheduling step into two requests (the `vector` reads fill the step's
+    /// batch), the `vector` request first and the `id` request second. If each
+    /// request carries its page's first row as priority, `id` gets 0 and
+    /// `vector` gets its page start: the queue admits `id` first, and then
+    /// refuses `vector`, which is neither at or below the lowest priority in
+    /// flight nor an admitted priority, and does not fit in the budget. The
+    /// decoder awaits the `vector` page before the `id` page, so `id` is never
+    /// consumed, its bytes never return, and the read hangs with no I/O in
+    /// flight. With each request tagged by the first row it is for, both
+    /// requests carry the same priority and the queue admits them together.
+    ///
+    /// The current-thread runtime queues both requests before the I/O loop
+    /// runs, which makes the admission order deterministic.
+    #[rstest]
+    #[tokio::test]
+    async fn test_read_deep_in_page_does_not_deadlock_io_budget(
+        #[values(ConcreteFileVersion::V2_1, ConcreteFileVersion::V2_2)]
+        version: ConcreteFileVersion,
+    ) {
+        const DIM: i32 = 1024;
+        const NUM_ROWS: usize = 16 * 1024;
+        const ROWS_PER_BATCH: usize = 256;
+        const READ_ROWS: usize = 3 * 1024;
+        // Far below one scheduling step's 8 MiB batch of vector reads.
+        const IO_BUFFER_SIZE: u64 = 1024 * 1024;
+
+        let fs = FsFixture::default();
+        let values = Float32Array::from(
+            (0..NUM_ROWS * DIM as usize)
+                .map(|v| v as f32)
+                .collect::<Vec<_>>(),
+        );
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new("item", DataType::Float32, false)),
+            DIM,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        let ids = Int32Array::from((0..NUM_ROWS as i32).collect::<Vec<_>>());
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("vector", vectors.data_type().clone(), false),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let data =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors), Arc::new(ids)]).unwrap();
+        // Written in 1 MiB batches against a 1 MiB per-column cache: every
+        // batch flushes a `vector` page, while `id` stays in one page.
+        let batches = (0..NUM_ROWS)
+            .step_by(ROWS_PER_BATCH)
+            .map(|offset| Ok(data.slice(offset, ROWS_PER_BATCH)))
+            .collect::<Vec<_>>();
+        write_lance_file(
+            RecordBatchIterator::new(batches, schema),
+            &fs,
+            version,
+            FileWriterOptions {
+                data_cache_bytes: Some(2 * 1024 * 1024),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig {
+                io_buffer_size_bytes: IO_BUFFER_SIZE,
+                use_lite_scheduler: Some(false),
+            },
+        );
+        let file_scheduler = scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let file_reader = FileReader::try_open(
+            file_scheduler,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        // The shape the deadlock needs: the read starts mid-way through a
+        // `vector` page that begins after the `id` page holding the same row.
+        let columns = &file_reader.metadata().column_infos;
+        assert_eq!(columns.len(), 2);
+        // The first row of each page.
+        let page_starts = |column: usize| {
+            columns[column]
+                .page_infos
+                .iter()
+                .scan(0, |start, page| {
+                    let page_start = *start;
+                    *start += page.num_rows;
+                    Some(page_start)
+                })
+                .collect::<Vec<_>>()
+        };
+        let page_start_of =
+            |starts: &[u64], row: u64| starts[starts.partition_point(|start| *start <= row) - 1];
+        let (vector_starts, id_starts) = (page_starts(0), page_starts(1));
+        let (vector_page_start, start) = vector_starts
+            .windows(2)
+            .map(|pair| (pair[0], (pair[0] + pair[1]) / 2))
+            .find(|(page_start, mid)| page_start_of(&id_starts, *mid) < *page_start)
+            .expect("a vector page that starts after its id page");
+        assert!(page_start_of(&id_starts, start) < vector_page_start);
+        assert!(vector_page_start < start);
+        let start = start as usize;
+        assert!(start + READ_ROWS <= NUM_ROWS);
+
+        let read = async {
+            file_reader
+                .read_stream(
+                    lance_io::ReadBatchParams::Range(start..start + READ_ROWS),
+                    1024,
+                    16,
+                    FilterExpression::no_filter(),
+                )
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap()
+        };
+        let batches = tokio::time::timeout(std::time::Duration::from_secs(20), read)
+            .await
+            .expect("the read deadlocked on the I/O scheduler's byte budget (knowdb #1059)");
+
+        let ids = batches
+            .iter()
+            .flat_map(|batch| batch["id"].as_primitive::<Int32Type>().values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (start as i32..(start + READ_ROWS) as i32).collect::<Vec<_>>()
+        );
     }
 }
