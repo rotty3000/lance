@@ -3106,6 +3106,8 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 Ok((range.start / self.row_scale)..(range.end / self.row_scale))
             })
             .collect::<Result<Vec<_>>>()?;
+        // With the fixed-size-list scale divided out, these count top-level rows.
+        let priority = request_priority(self.priority, &ranges);
 
         let mut chunks_needed = Vec::new();
         let selection = slice_sparse_plan(&page_meta.plan, &ranges, page_meta.row_domain)?;
@@ -3123,7 +3125,7 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
             .iter()
             .map(|chunk| chunk.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+        let loaded_chunk_data = io.submit_request(chunk_ranges, priority);
         let ranges = VecDeque::from(ranges);
         let value_decompressor = self.value_decompressor.clone();
         let value_encoding = self.value_encoding.clone();

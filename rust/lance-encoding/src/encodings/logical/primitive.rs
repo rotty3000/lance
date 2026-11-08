@@ -2929,7 +2929,8 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data = io.submit_request(chunk_ranges, self.priority);
+        let loaded_chunk_data =
+            io.submit_request(chunk_ranges, request_priority(self.priority, ranges));
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -3320,7 +3321,7 @@ impl FullZipScheduler {
     ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let data_buf_position = self.data_buf_position;
-        let priority = self.priority;
+        let priority = request_priority(self.priority, ranges);
         let details = self.details.clone();
         let bits_per_offset = self.bits_per_offset;
 
@@ -3425,7 +3426,7 @@ impl FullZipScheduler {
             })
             .collect::<Vec<_>>();
 
-        let io_future = io.submit_request(byte_ranges, self.priority);
+        let io_future = io.submit_request(byte_ranges, request_priority(self.priority, ranges));
         let page_load_task = Self::create_page_load_task(
             io_future,
             num_rows,
@@ -4784,6 +4785,27 @@ impl CacheKey for PageDataCacheKey {
 struct PageRangeMapping {
     page_idx: usize,
     ranges_in_page: Vec<Range<u64>>,
+}
+
+/// The I/O priority of a read of `ranges` (ordered rows, relative to the page)
+/// from a page whose first row is `page_priority`.
+///
+/// A read is prioritized by the first row it is for, not by its page's first
+/// row. Past an exhausted byte budget the I/O scheduler admits only a request
+/// at or below the lowest priority in flight, or one equal to an admitted
+/// priority, and that avoids deadlock only while reads are consumed in
+/// priority order. The decoder awaits the pages of a scan line one after
+/// another, so they must share one priority. Tagged with their page starts, a
+/// read deep inside a long page of one column got that page's much lower
+/// start, was admitted first, and held the lowest in-flight priority below its
+/// sibling from a column whose page starts later. The decoder awaited the
+/// sibling first, so the admitted read was never consumed, its bytes never
+/// came back, and the read hung with no I/O in flight (knowdb #1059).
+///
+/// Rows beneath a fixed-size list of structs count child rows, which this does
+/// not rescale, like the blob page scheduler's priority.
+fn request_priority(page_priority: u64, ranges: &[Range<u64>]) -> u64 {
+    page_priority.saturating_add(ranges.first().map_or(0, |range| range.start))
 }
 
 /// Visits every intersection between ordered row ranges and ordered pages.
