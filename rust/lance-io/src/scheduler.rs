@@ -377,7 +377,8 @@ struct MutableBatch<F: FnOnce(Response) + Send> {
     data_buffers: Vec<Bytes>,
     num_bytes: u64,
     priority: u128,
-    num_reqs: usize,
+    // Tasks the queue admitted, each holding one priority reservation.
+    num_admitted: usize,
     num_delivered: usize,
     err: Option<Error>,
     // When true, report 0 bytes consumed so the backpressure budget is unaffected
@@ -392,7 +393,6 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         when_done: F,
         num_data_buffers: u32,
         priority: u128,
-        num_reqs: usize,
         bypass_backpressure: bool,
         io_queue: Arc<IoQueue>,
     ) -> Self {
@@ -401,7 +401,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
             num_bytes: 0,
             priority,
-            num_reqs,
+            num_admitted: 0,
             num_delivered: 0,
             err: None,
             bypass_backpressure,
@@ -443,7 +443,7 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
                 self.num_bytes
             },
             priority: self.priority,
-            num_reqs: self.num_reqs,
+            num_reqs: self.num_admitted,
         };
         (self.when_done.take().unwrap())(response);
     }
@@ -451,7 +451,9 @@ impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
 
 struct DataChunk {
     task_idx: usize,
+    // Bytes the task reserved: 0 for a task cancelled before admission.
     num_bytes: u64,
+    was_admitted: bool,
     data: Result<Bytes>,
 }
 
@@ -464,6 +466,7 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
     fn deliver_data(&mut self, data: DataChunk) {
         self.num_bytes += data.num_bytes;
         self.num_delivered += 1;
+        self.num_admitted += usize::from(data.was_admitted);
         match data.data {
             Ok(data_bytes) => {
                 self.data_buffers[data.task_idx] = data_bytes;
@@ -479,7 +482,8 @@ impl<F: FnOnce(Response) + Send> DataSink for MutableBatch<F> {
 struct IoTask {
     reader: Arc<dyn Reader>,
     to_read: Range<u64>,
-    when_done: Box<dyn FnOnce(Result<Bytes>) + Send>,
+    // Called with the read's result and whether the queue admitted the task.
+    when_done: Box<dyn FnOnce(Result<Bytes>, bool) + Send>,
     priority: u128,
     bypass_backpressure: bool,
 }
@@ -529,10 +533,20 @@ impl IoTask {
     fn num_bytes(&self) -> u64 {
         self.to_read.end - self.to_read.start
     }
+    // DEPENDENCY: backport of upstream a4a17efd7 (#8780, lance >= 15.0.0-beta.8); drop when the fork moves to lance >= 15
+    //
+    // A cancelled task was never admitted: it holds no I/O slot, no bytes and
+    // no priority reservation. Reporting it as unadmitted keeps its completion
+    // from returning a slot, refunding bytes it never reserved, and removing a
+    // reservation at the same priority that belongs to another request. Only
+    // the accounting part is backported, not the fail-fast error mode.
     fn cancel(self) {
-        (self.when_done)(Err(Error::internal(
-            "Scheduler closed before I/O was completed".to_string(),
-        )));
+        (self.when_done)(
+            Err(Error::internal(
+                "Scheduler closed before I/O was completed".to_string(),
+            )),
+            false,
+        );
     }
 
     async fn run(self) {
@@ -563,7 +577,7 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
-        (self.when_done)(bytes);
+        (self.when_done)(bytes, true);
     }
 }
 
@@ -1023,7 +1037,6 @@ impl ScanScheduler {
             when_all_io_done,
             num_iops,
             priority,
-            request.len(),
             bypass_backpressure,
             io_queue.clone(),
         ))));
@@ -1037,13 +1050,18 @@ impl ScanScheduler {
                 to_read: iop,
                 priority,
                 bypass_backpressure,
-                when_done: Box::new(move |data| {
-                    io_queue_clone.on_iop_complete();
+                // An unadmitted (cancelled) task returns no slot and no bytes;
+                // see `IoTask::cancel`.
+                when_done: Box::new(move |data, was_admitted| {
+                    if was_admitted {
+                        io_queue_clone.on_iop_complete();
+                    }
                     let mut dest = dest.lock().unwrap();
                     let chunk = DataChunk {
                         data,
                         task_idx,
-                        num_bytes,
+                        num_bytes: if was_admitted { num_bytes } else { 0 },
+                        was_admitted,
                     };
                     dest.deliver_data(chunk);
                 }),
@@ -1448,7 +1466,7 @@ mod tests {
                 path: Path::parse("test").unwrap(),
             }),
             to_read: 0..1,
-            when_done: Box::new(|_| {}),
+            when_done: Box::new(|_, _| {}),
             priority,
             bypass_backpressure,
         }
@@ -1521,7 +1539,6 @@ mod tests {
             move |rsp| *response_clone.lock().unwrap() = Some(rsp),
             2, // num_data_buffers
             0, // priority
-            2, // num_reqs
             false,
             io_queue,
         );
@@ -1533,6 +1550,54 @@ mod tests {
             data.is_err(),
             "undelivered slot must yield an error, got {data:?}",
         );
+    }
+
+    /// Cancelling a request the queue never admitted gives back nothing it
+    /// never took: no I/O slot, no bytes, and no other request's priority
+    /// reservation (backport of upstream a4a17efd7, #8780).
+    #[tokio::test]
+    async fn test_cancel_unadmitted_request_leaves_accounting_untouched() {
+        const PRIORITY: u128 = 7;
+        let snapshot = |queue: &IoQueue| {
+            let state = queue.state.lock().unwrap();
+            (
+                state.iops_avail,
+                state.bytes_avail,
+                state.priorities_in_flight.in_flight.clone(),
+            )
+        };
+        let scheduler = ScanScheduler::new(
+            Arc::new(ObjectStore::memory()),
+            SchedulerConfig::default_for_testing(),
+        );
+        // No I/O loop runs this queue: a task is admitted only when popped here.
+        let queue = Arc::new(IoQueue::new(4, 1024, IoStats::new()));
+
+        // An admitted request holds a slot, its bytes and a reservation at PRIORITY.
+        queue.push(make_task(PRIORITY, false));
+        let admitted = queue.state.lock().unwrap().next_task().unwrap();
+        let before = snapshot(&queue);
+        assert_eq!(before, (3, 1023, vec![PRIORITY]));
+
+        // A request at the same priority is queued, never admitted, and
+        // cancelled when the queue closes.
+        let reader: Arc<dyn Reader> = Arc::new(TrackingReader {
+            get_range_count: Arc::new(AtomicU64::new(0)),
+            path: Path::parse("test").unwrap(),
+        });
+        let (tx, rx) = oneshot::channel();
+        scheduler.do_submit_request(reader, vec![0..100, 100..300], tx, PRIORITY, &queue, false);
+        queue.close();
+
+        let mut response = rx.await.unwrap();
+        assert!(response.data.take().unwrap().is_err());
+        drop(response);
+        assert_eq!(
+            snapshot(&queue),
+            before,
+            "the cancelled request must not refund a slot, bytes or a reservation it never took"
+        );
+        drop(admitted);
     }
 
     #[tokio::test]
