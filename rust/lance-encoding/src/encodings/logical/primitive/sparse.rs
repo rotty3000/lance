@@ -3089,6 +3089,8 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 Error::invalid_input_source("Sparse structural encoded row domain overflows".into())
             })?;
         let num_rows = validate_slice_ranges(ranges, encoded_row_domain, "row")?;
+        // The layout's fixed-size-list layers give its own row scale.
+        let priority = request_priority(self.priority, ranges, self.row_scale);
         let ranges = ranges
             .iter()
             .map(|range| {
@@ -3106,8 +3108,6 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 Ok((range.start / self.row_scale)..(range.end / self.row_scale))
             })
             .collect::<Result<Vec<_>>>()?;
-        // With the fixed-size-list scale divided out, these count top-level rows.
-        let priority = request_priority(self.priority, &ranges);
 
         let mut chunks_needed = Vec::new();
         let selection = slice_sparse_plan(&page_meta.plan, &ranges, page_meta.row_domain)?;

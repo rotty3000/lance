@@ -2205,6 +2205,9 @@ pub struct MiniBlockScheduler {
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
     has_large_chunk: bool,
+    /// Page rows per top-level row: above 1 only beneath a fixed-size list of
+    /// structs. Divided out of a read's first row to give its I/O priority.
+    row_scale: u64,
 }
 
 impl MiniBlockScheduler {
@@ -2289,6 +2292,7 @@ impl MiniBlockScheduler {
             def_meaning: def_meaning.into(),
             page_meta: None,
             has_large_chunk: layout.has_large_chunk,
+            row_scale: 1,
         })
     }
 
@@ -2929,8 +2933,10 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             .iter()
             .map(|c| c.byte_range.clone())
             .collect::<Vec<_>>();
-        let loaded_chunk_data =
-            io.submit_request(chunk_ranges, request_priority(self.priority, ranges));
+        let loaded_chunk_data = io.submit_request(
+            chunk_ranges,
+            request_priority(self.priority, ranges, self.row_scale),
+        );
 
         let rep_decompressor = self.rep_decompressor.clone();
         let def_decompressor = self.def_decompressor.clone();
@@ -3083,6 +3089,9 @@ pub struct FullZipScheduler {
     cached_state: Option<Arc<FullZipCacheableState>>,
     /// Whether repetition index metadata should be cached during initialize.
     enable_cache: bool,
+    /// Page rows per top-level row: above 1 only beneath a fixed-size list of
+    /// structs. Divided out of a read's first row to give its I/O priority.
+    row_scale: u64,
 }
 
 impl FullZipScheduler {
@@ -3165,6 +3174,7 @@ impl FullZipScheduler {
             bits_per_offset,
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         })
     }
 
@@ -3321,7 +3331,7 @@ impl FullZipScheduler {
     ) -> Result<Vec<PageLoadTask>> {
         let num_rows = ranges.iter().map(|r| r.end - r.start).sum();
         let data_buf_position = self.data_buf_position;
-        let priority = request_priority(self.priority, ranges);
+        let priority = request_priority(self.priority, ranges, self.row_scale);
         let details = self.details.clone();
         let bits_per_offset = self.bits_per_offset;
 
@@ -3426,7 +3436,10 @@ impl FullZipScheduler {
             })
             .collect::<Vec<_>>();
 
-        let io_future = io.submit_request(byte_ranges, request_priority(self.priority, ranges));
+        let io_future = io.submit_request(
+            byte_ranges,
+            request_priority(self.priority, ranges, self.row_scale),
+        );
         let page_load_task = Self::create_page_load_task(
             io_future,
             num_rows,
@@ -4315,6 +4328,9 @@ pub struct StructuralPrimitiveFieldScheduler {
     page_source: Option<PageSchedulerSource>,
     column_index: u32,
     target_data_type_tag: Arc<str>,
+    /// Column rows per top-level row, passed to every page scheduler built
+    /// (see [`Self::with_row_scale`]).
+    row_scale: u64,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -4348,6 +4364,7 @@ impl StructuralPrimitiveFieldScheduler {
                 decompressors,
                 cache_repetition_index,
                 target_field,
+                1,
             )?);
             row_start = row_end;
         }
@@ -4357,6 +4374,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_source: None,
             column_index: column_info.index,
             target_data_type_tag: format!("{:?}", target_field.data_type()).into(),
+            row_scale: 1,
         })
     }
 
@@ -4383,7 +4401,21 @@ impl StructuralPrimitiveFieldScheduler {
                 cache_repetition_index,
                 target_field: target_field.clone(),
             }),
+            row_scale: 1,
         })
+    }
+
+    /// Sets how many of this column's rows make one top-level row. It is above
+    /// 1 only beneath a fixed-size list of structs, whose scheduler multiplies
+    /// the row ranges it hands down by its dimension; the page schedulers built
+    /// afterwards divide it out of their reads' I/O priorities (knowdb #1059).
+    pub fn with_row_scale(mut self, row_scale: u64) -> Self {
+        debug_assert!(
+            self.page_schedulers.is_empty(),
+            "the row scale must be set before any page scheduler is built"
+        );
+        self.row_scale = row_scale;
+        self
     }
 
     /// Exclusive end row of every page of `column_info`, in page order.
@@ -4422,6 +4454,7 @@ impl StructuralPrimitiveFieldScheduler {
             page_source: None,
             column_index,
             target_data_type_tag,
+            row_scale: 1,
         }
     }
 
@@ -4477,6 +4510,7 @@ impl StructuralPrimitiveFieldScheduler {
                     source.decompressors.as_ref(),
                     source.cache_repetition_index,
                     &source.target_field,
+                    self.row_scale,
                 )?);
             }
             if !missing.is_empty() {
@@ -4508,16 +4542,21 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        row_scale: u64,
     ) -> Result<Box<dyn StructuralPageScheduler>> {
         use pb21::page_layout::Layout;
         Ok(match page_layout.layout.as_ref().expect_ok()? {
-            Layout::MiniBlockLayout(mini_block) => Box::new(MiniBlockScheduler::try_new(
-                &page_info.buffer_offsets_and_sizes,
-                page_info.priority,
-                mini_block.num_items,
-                mini_block,
-                decompressors,
-            )?),
+            Layout::MiniBlockLayout(mini_block) => {
+                let mut scheduler = MiniBlockScheduler::try_new(
+                    &page_info.buffer_offsets_and_sizes,
+                    page_info.priority,
+                    mini_block.num_items,
+                    mini_block,
+                    decompressors,
+                )?;
+                scheduler.row_scale = row_scale;
+                Box::new(scheduler)
+            }
             Layout::SparseLayout(sparse_layout) => {
                 Box::new(sparse::SparseStructuralScheduler::try_new(
                     &page_info.buffer_offsets_and_sizes,
@@ -4537,6 +4576,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                 )?;
                 scheduler.enable_cache = cache_repetition_index;
+                scheduler.row_scale = row_scale;
                 Box::new(scheduler)
             }
             Layout::ConstantLayout(constant_layout) => {
@@ -4588,6 +4628,7 @@ impl StructuralPrimitiveFieldScheduler {
                     decompressors,
                     cache_repetition_index,
                     target_field,
+                    row_scale,
                 )?;
                 let def_meaning = blob
                     .layers
@@ -4606,6 +4647,7 @@ impl StructuralPrimitiveFieldScheduler {
                         inner_scheduler,
                         page_info.priority,
                         page_info.num_rows,
+                        row_scale,
                         def_meaning.into(),
                     ))
                 }
@@ -4620,6 +4662,7 @@ impl StructuralPrimitiveFieldScheduler {
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
+        row_scale: u64,
     ) -> Result<PageInfoAndScheduler> {
         let page_layout = page_info.encoding.as_structural();
         let scheduler = Self::page_layout_to_scheduler(
@@ -4628,6 +4671,7 @@ impl StructuralPrimitiveFieldScheduler {
             decompressors,
             cache_repetition_index,
             target_field,
+            row_scale,
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
@@ -4788,7 +4832,8 @@ struct PageRangeMapping {
 }
 
 /// The I/O priority of a read of `ranges` (ordered rows, relative to the page)
-/// from a page whose first row is `page_priority`.
+/// from a page whose first row is `page_priority`, with `row_scale` page rows
+/// per top-level row.
 ///
 /// A read is prioritized by the first row it is for, not by its page's first
 /// row. Past an exhausted byte budget the I/O scheduler admits only a request
@@ -4802,10 +4847,14 @@ struct PageRangeMapping {
 /// sibling first, so the admitted read was never consumed, its bytes never
 /// came back, and the read hung with no I/O in flight (knowdb #1059).
 ///
-/// Rows beneath a fixed-size list of structs count child rows, which this does
-/// not rescale, like the blob page scheduler's priority.
-fn request_priority(page_priority: u64, ranges: &[Range<u64>]) -> u64 {
-    page_priority.saturating_add(ranges.first().map_or(0, |range| range.start))
+/// `PageInfo.priority` counts top-level rows, but beneath a fixed-size list
+/// of structs a page counts child rows (`row_scale` per top-level row). The
+/// offset is divided by `row_scale` so it counts top-level rows too: an
+/// offset left in child rows overshoots past a sibling's page boundary, and
+/// that order inversion is the same deadlock.
+fn request_priority(page_priority: u64, ranges: &[Range<u64>], row_scale: u64) -> u64 {
+    let offset = ranges.first().map_or(0, |range| range.start) / row_scale.max(1);
+    page_priority.saturating_add(offset)
 }
 
 /// Visits every intersection between ordered row ranges and ordered pages.
@@ -9625,6 +9674,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -10548,6 +10598,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: true,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
@@ -10673,6 +10724,7 @@ mod tests {
             }),
             cached_state: None,
             enable_cache: false,
+            row_scale: 1,
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();

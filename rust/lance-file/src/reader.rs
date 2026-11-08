@@ -4834,7 +4834,12 @@ mod tests {
         const NUM_ROWS: usize = 16 * 1024;
         const ROWS_PER_BATCH: usize = 256;
         const READ_ROWS: usize = 3 * 1024;
-        // Far below one scheduling step's 8 MiB batch of vector reads.
+        // The split needs the read's vector bytes to overflow one scheduling
+        // step's request batch (lance-encoding's `IO_REQUEST_BATCH_BYTES`,
+        // 8 MiB), so the vector reads go out before the `id` read.
+        const STEP_BATCH_BYTES: usize = 8 * 1024 * 1024;
+        const _: () = assert!(READ_ROWS * DIM as usize * 4 > STEP_BATCH_BYTES);
+        // Far below one step's batch of vector reads.
         const IO_BUFFER_SIZE: u64 = 1024 * 1024;
 
         let fs = FsFixture::default();
@@ -4857,8 +4862,9 @@ mod tests {
         ]));
         let data =
             RecordBatch::try_new(schema.clone(), vec![Arc::new(vectors), Arc::new(ids)]).unwrap();
-        // Written in 1 MiB batches against a 1 MiB per-column cache: every
-        // batch flushes a `vector` page, while `id` stays in one page.
+        // Written in 1 MiB batches against a 2 MiB cache split over the two
+        // columns (1 MiB each): every batch flushes a `vector` page, while `id`
+        // fills few pages.
         let batches = (0..NUM_ROWS)
             .step_by(ROWS_PER_BATCH)
             .map(|offset| Ok(data.slice(offset, ROWS_PER_BATCH)))
