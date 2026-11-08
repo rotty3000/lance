@@ -555,3 +555,67 @@ impl DecodePageTask for BlobDecodePageTask {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::encodings::logical::primitive::SimpleAllNullScheduler;
+
+    /// Answers every range with zeros and records each request's priority.
+    #[derive(Debug, Default)]
+    struct PriorityRecorder {
+        priorities: Mutex<Vec<u64>>,
+    }
+
+    impl EncodingsIo for PriorityRecorder {
+        fn submit_request(
+            &self,
+            ranges: Vec<Range<u64>>,
+            priority: u64,
+        ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+            self.priorities.lock().unwrap().push(priority);
+            let buffers = ranges
+                .iter()
+                .map(|range| Bytes::from(vec![0; (range.end - range.start) as usize]))
+                .collect();
+            std::future::ready(Ok(buffers)).boxed()
+        }
+    }
+
+    /// knowdb #1059: a blob read carries the first top-level row it is for,
+    /// with the page's child rows per top-level row (`row_scale`, above 1
+    /// beneath a fixed-size list of structs) divided out.
+    #[test]
+    fn test_blob_read_priority_is_first_requested_top_level_row() {
+        // The page starts at top-level row 100 and holds 40 eight-byte blobs.
+        const PAGE_PRIORITY: u64 = 100;
+        const NUM_ROWS: u64 = 40;
+        for (row_scale, expected) in [(1, PAGE_PRIORITY + 12), (4, PAGE_PRIORITY + 3)] {
+            let mut scheduler = BlobPageScheduler::new(
+                Box::new(SimpleAllNullScheduler::default()),
+                PAGE_PRIORITY,
+                NUM_ROWS,
+                row_scale,
+                Arc::new([DefinitionInterpretation::NullableItem]),
+            );
+            let state: Arc<dyn CachedPageData> = Arc::new(BlobCacheableState {
+                positions: Arc::new(UInt64Array::from_iter_values((0..NUM_ROWS).map(|i| i * 8))),
+                sizes: Arc::new(UInt64Array::from(vec![8; NUM_ROWS as usize])),
+            });
+            scheduler.try_load(&state).unwrap();
+
+            let recorder = Arc::new(PriorityRecorder::default());
+            let io: Arc<dyn EncodingsIo> = recorder.clone();
+            // Page rows 12..16 are top-level row 3 of the page at a scale of 4.
+            let tasks = scheduler.schedule_ranges(&[12..16, 20..24], &io).unwrap();
+            assert!(!tasks.is_empty());
+            assert_eq!(
+                *recorder.priorities.lock().unwrap(),
+                vec![expected],
+                "row_scale={row_scale}"
+            );
+        }
+    }
+}

@@ -481,7 +481,58 @@ impl CachedPageData for CachedPlanarSparse {
     }
 }
 
+/// Submits every read at one fixed priority, whatever the caller asks for.
+///
+/// knowdb #1059: a sparse page's value schedulers address leaf slots, not
+/// top-level rows, so the priority they would derive from their own ranges is
+/// not the first top-level row the read is for. The page scheduler knows that
+/// row and pins it here, so every read of one scan line shares a priority.
+#[derive(Debug)]
+struct FixedPriorityIo {
+    inner: Arc<dyn EncodingsIo>,
+    priority: u64,
+}
+
+impl FixedPriorityIo {
+    fn wrap(inner: Arc<dyn EncodingsIo>, priority: u64) -> Arc<dyn EncodingsIo> {
+        Arc::new(Self { inner, priority })
+    }
+}
+
+impl EncodingsIo for FixedPriorityIo {
+    fn submit_request(
+        &self,
+        range: Vec<Range<u64>>,
+        _priority: u64,
+    ) -> BoxFuture<'static, Result<Vec<Bytes>>> {
+        self.inner.submit_request(range, self.priority)
+    }
+
+    fn with_bypass_backpressure(&self) -> Option<Arc<dyn EncodingsIo>> {
+        self.inner
+            .with_bypass_backpressure()
+            .map(|inner| Self::wrap(inner, self.priority))
+    }
+
+    fn with_io_stats(
+        &self,
+        stats: Arc<dyn lance_core::utils::io_stats::IoStatsRecorder>,
+    ) -> Option<Arc<dyn EncodingsIo>> {
+        self.inner
+            .with_io_stats(stats)
+            .map(|inner| Self::wrap(inner, self.priority))
+    }
+
+    fn with_coalesce_gap(&self, gap: u64) -> Option<Arc<dyn EncodingsIo>> {
+        self.inner
+            .with_coalesce_gap(gap)
+            .map(|inner| Self::wrap(inner, self.priority))
+    }
+}
+
 pub(in crate::encodings::logical::primitive) struct PlanarSparseScheduler {
+    /// The page's first top-level row (`PageInfo.priority`).
+    priority: u64,
     layers: Vec<SparseLayerDecompressors>,
     structural_buffers: Vec<Range<u64>>,
     values: ValueStorage,
@@ -668,6 +719,7 @@ impl PlanarSparseScheduler {
             .map(|&(p, s)| checked_buffer_range(p, s, "planar structure"))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            priority: page.priority,
             layers,
             structural_buffers,
             values,
@@ -905,6 +957,12 @@ impl StructuralPageScheduler for PlanarSparseScheduler {
                 Ok(r.start / self.row_scale..r.end / self.row_scale)
             })
             .collect::<Result<Vec<_>>>()?;
+        // With the layout's fixed-size-list scale divided out, these count
+        // top-level rows (knowdb #1059; see `FixedPriorityIo`).
+        let io = &FixedPriorityIo::wrap(
+            io.clone(),
+            super::super::request_priority(self.priority, &ranges, 1),
+        );
         let selection = slice_sparse_plan(&state.plan, &ranges, self.rows)?;
         let selected = select_position_set(
             &state.positions,
