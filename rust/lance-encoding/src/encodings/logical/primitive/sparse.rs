@@ -3089,7 +3089,11 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 Error::invalid_input_source("Sparse structural encoded row domain overflows".into())
             })?;
         let num_rows = validate_slice_ranges(ranges, encoded_row_domain, "row")?;
-        // The layout's fixed-size-list layers give its own row scale.
+        // The layout's fixed-size-list layers give its row scale. They include
+        // every fixed-size list of structs above the column (that encoder adds
+        // an FSL layer to the rep/def), so this already divides out the scale
+        // the field scheduler gives the other page schedulers (`row_scale` in
+        // `page_layout_to_scheduler`); applying that as well would divide twice.
         let priority = request_priority(self.priority, ranges, self.row_scale);
         let ranges = ranges
             .iter()

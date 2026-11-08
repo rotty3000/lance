@@ -3501,6 +3501,7 @@ pub async fn decode_batch(
 // test coalesce indices to ranges
 mod tests {
     use super::*;
+    use crate::testing::{TestEncoding, test_encoding_strategy};
     use arrow_array::{
         Array, FixedSizeListArray, Float32Array, Int32Array, StringArray, StructArray,
     };
@@ -4255,31 +4256,25 @@ mod tests {
         }
     }
 
-    /// Encodes `array` as the only column and reads `ranges` of it. Returns the
-    /// layout of the leaf column's single page and the priority of every read
-    /// made for the rows (page initialization is done before recording).
+    /// Encodes `column` as the only column with `encoding` and reads `ranges`
+    /// of it. Returns the layout of the leaf column's single page and the
+    /// priority of every read made for the rows (page initialization is done
+    /// before recording).
     async fn read_priorities(
-        array: ArrayRef,
+        (field, array): (ArrowField, ArrayRef),
+        encoding: TestEncoding,
         ranges: &[Range<u64>],
         cache_repetition_index: bool,
     ) -> (&'static str, Vec<u64>) {
-        use crate::{
-            encoder::{EncodingOptions, encode_batch},
-            testing::{TestEncoding, test_encoding_strategy},
-        };
+        use crate::encoder::{EncodingOptions, encode_batch};
         use pb21::page_layout::Layout;
 
-        // StructuralU32 enables FixedSizeList<Struct>.
-        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
-            "c",
-            array.data_type().clone(),
-            false,
-        )]));
+        let schema = Arc::new(ArrowSchema::new(vec![field]));
         let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
         let encoded = encode_batch(
             &batch,
             Arc::new(Schema::try_from(schema.as_ref()).unwrap()),
-            test_encoding_strategy(TestEncoding::StructuralU32).as_ref(),
+            test_encoding_strategy(encoding).as_ref(),
             &EncodingOptions::default(),
         )
         .await
@@ -4297,6 +4292,9 @@ mod tests {
             PageEncoding::Structural(pb21::PageLayout {
                 layout: Some(Layout::FullZipLayout(_)),
             }) => "full-zip simple",
+            PageEncoding::Structural(pb21::PageLayout {
+                layout: Some(Layout::SparseLayout(_)),
+            }) => "sparse",
             other => panic!("unexpected page encoding {other:?}"),
         };
 
@@ -4349,69 +4347,125 @@ mod tests {
 
     /// knowdb #1059: every page read carries the first top-level row it is
     /// for, at each patched site (mini-block, full-zip with a repetition index,
-    /// cached and not, and full-zip without), including beneath a fixed-size
-    /// list of structs, whose leaf pages count `dimension` rows per top-level
-    /// row.
+    /// cached and not, full-zip without, and sparse), including beneath a
+    /// fixed-size list of structs, whose leaf pages count `dimension` rows per
+    /// top-level row.
     #[tokio::test]
     async fn test_read_priority_is_first_requested_top_level_row() {
         const ROWS: usize = 1000;
         const FIRST_ROW: u64 = 300;
-        // Plain columns hold `ROWS` values; beneath an FSL<Struct> of
-        // dimension d the leaf holds `ROWS * d`.
-        let ints =
-            |n: usize| Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())) as ArrayRef;
+        // Each builder makes a nullable column of `n` values, tagged with the
+        // field metadata that selects its layout. Beneath an FSL<Struct> of
+        // dimension d the leaf holds `ROWS * d` values.
+        type Column = (ArrowField, ArrayRef);
+        let column = |array: ArrayRef, metadata: &[(&str, &str)]| -> Column {
+            let field = ArrowField::new("c", array.data_type().clone(), true).with_metadata(
+                metadata
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            );
+            (field, array)
+        };
+        let ints = |n: usize| {
+            column(
+                Arc::new(Int32Array::from((0..n as i32).collect::<Vec<_>>())),
+                &[],
+            )
+        };
         let vectors = |n: usize| {
-            Arc::new(
-                FixedSizeListArray::try_new(
-                    Arc::new(ArrowField::new("item", DataType::Float32, false)),
-                    128,
-                    Arc::new(Float32Array::from(
-                        (0..n * 128).map(|v| v as f32).collect::<Vec<_>>(),
-                    )),
-                    None,
-                )
-                .unwrap(),
-            ) as ArrayRef
+            column(
+                Arc::new(
+                    FixedSizeListArray::try_new(
+                        Arc::new(ArrowField::new("item", DataType::Float32, false)),
+                        128,
+                        Arc::new(Float32Array::from(
+                            (0..n * 128).map(|v| v as f32).collect::<Vec<_>>(),
+                        )),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                &[],
+            )
         };
+        // 300 bytes a value: too wide for mini-block.
         let strings = |n: usize| {
-            // 300 bytes a value: too wide for mini-block.
-            Arc::new(StringArray::from(
-                (0..n).map(|i| format!("{i:0>300}")).collect::<Vec<_>>(),
-            )) as ArrayRef
+            column(
+                Arc::new(StringArray::from(
+                    (0..n).map(|i| format!("{i:0>300}")).collect::<Vec<_>>(),
+                )),
+                &[],
+            )
         };
-        let fsl_of_struct = |child: ArrayRef, dimension: i32| {
-            let item = StructArray::from(vec![(
-                Arc::new(ArrowField::new("v", child.data_type().clone(), false)),
-                child,
-            )]);
-            Arc::new(
+        // One value in seven set.
+        let sparse_ints = |n: usize| {
+            column(
+                Arc::new(Int32Array::from(
+                    (0..n as i32)
+                        .map(|i| (i % 7 == 0).then_some(i))
+                        .collect::<Vec<_>>(),
+                )),
+                &[(
+                    crate::constants::STRUCTURAL_ENCODING_META_KEY,
+                    crate::constants::STRUCTURAL_ENCODING_SPARSE,
+                )],
+            )
+        };
+        // Layout metadata is read from the top-level field, so it moves there.
+        let fsl_of_struct = |(field, child): Column, dimension: i32| -> Column {
+            let metadata = field.metadata().clone();
+            let item = StructArray::try_new(
+                Fields::from(vec![field.with_name("v").with_metadata(Default::default())]),
+                vec![child],
+                None,
+            )
+            .unwrap();
+            let array = Arc::new(
                 FixedSizeListArray::try_new(
-                    Arc::new(ArrowField::new("item", item.data_type().clone(), false)),
+                    Arc::new(ArrowField::new("item", item.data_type().clone(), true)),
                     dimension,
                     Arc::new(item),
                     None,
                 )
                 .unwrap(),
-            ) as ArrayRef
+            ) as ArrayRef;
+            let field =
+                ArrowField::new("c", array.data_type().clone(), true).with_metadata(metadata);
+            (field, array)
         };
+        // StructuralU32 enables FixedSizeList<Struct>; only
+        // StructuralSparse writes sparse pages.
+        let dense = TestEncoding::StructuralU32;
+        let sparse = TestEncoding::StructuralSparse;
         let cases = [
-            ("int32", ints(ROWS), "mini-block"),
-            ("vector", vectors(ROWS), "full-zip simple"),
-            ("string", strings(ROWS), "full-zip rep"),
+            ("int32", ints(ROWS), dense, "mini-block"),
+            ("vector", vectors(ROWS), dense, "full-zip simple"),
+            ("string", strings(ROWS), dense, "full-zip rep"),
+            ("sparse int32", sparse_ints(ROWS), sparse, "sparse"),
             (
                 "fsl<struct<int32>, 4>",
                 fsl_of_struct(ints(ROWS * 4), 4),
+                dense,
                 "mini-block",
             ),
             (
                 "fsl<struct<vector>, 2>",
                 fsl_of_struct(vectors(ROWS * 2), 2),
+                dense,
                 "full-zip simple",
             ),
             (
                 "fsl<struct<string>, 3>",
                 fsl_of_struct(strings(ROWS * 3), 3),
+                dense,
                 "full-zip rep",
+            ),
+            (
+                "fsl<struct<sparse int32>, 4>",
+                fsl_of_struct(sparse_ints(ROWS * 4), 4),
+                sparse,
+                "sparse",
             ),
         ];
         let requests = [
@@ -4419,11 +4473,12 @@ mod tests {
             vec![FIRST_ROW..FIRST_ROW + 5, 700..702],
         ];
         let mut failures = Vec::new();
-        for (name, array, expected_layout) in cases {
+        for (name, column, encoding, expected_layout) in cases {
             for ranges in &requests {
                 for cache_repetition_index in [false, true] {
                     let (layout, priorities) =
-                        read_priorities(array.clone(), ranges, cache_repetition_index).await;
+                        read_priorities(column.clone(), encoding, ranges, cache_repetition_index)
+                            .await;
                     let case = format!(
                         "{name} {ranges:?} cache_repetition_index={cache_repetition_index}"
                     );
