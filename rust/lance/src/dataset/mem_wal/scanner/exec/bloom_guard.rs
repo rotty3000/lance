@@ -236,6 +236,13 @@ pub fn compute_pk_hash_from_scalars(values: &[datafusion::common::ScalarValue]) 
             | datafusion::common::ScalarValue::LargeUtf8(v) => hash_opt(&mut hasher, v),
             datafusion::common::ScalarValue::Binary(v)
             | datafusion::common::ScalarValue::LargeBinary(v) => hash_opt(&mut hasher, v),
+            // FORK PATCH (knowdb): the keys `is_supported_pk_type` admits beyond
+            // upstream's list, hashed exactly as `compute_pk_hash` hashes their
+            // arrays (a fixed-size binary as its byte slice, like `Binary`), so
+            // a key hashes the same on both paths.
+            datafusion::common::ScalarValue::Date32(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::Date64(v) => hash_opt(&mut hasher, v),
+            datafusion::common::ScalarValue::FixedSizeBinary(_, v) => hash_opt(&mut hasher, v),
             // Unsupported types: validated out at the scanner boundary, but
             // distinguish by value rather than collapse if reached.
             _ => {
