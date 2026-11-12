@@ -317,11 +317,27 @@ fn subtree_has_blob(field: &lance_core::datatypes::Field) -> bool {
 // Schema an "update if" condition is planned against: a `source` struct and a `target` struct.
 // Every child is nullable; the source schema's nullability does not describe the target data.
 fn combined_schema(source: &Schema, target: &Schema) -> Schema {
+    // knowdb #1088: the struct fields are a nullable VIEW for parsing and
+    // evaluating the "update if" condition, never a table schema, so they drop
+    // the unenforced-primary-key markers. `Planner::parse_filter` converts this
+    // schema to a lance `Schema`, whose `TryFrom` runs `verify_primary_key`;
+    // a key column made nullable here while keeping its marker failed every
+    // conditional merge_insert on a table with an unenforced primary key
+    // ("Primary key column and all its ancestors must not be nullable").
+    // 13.0.0 kept the source fields as they were (#9950 made them nullable).
     let nullable = |schema: &Schema| -> Fields {
         schema
             .fields
             .iter()
-            .map(|f| f.as_ref().clone().with_nullable(true))
+            .map(|f| {
+                let mut metadata = f.metadata().clone();
+                metadata.remove(lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY);
+                metadata.remove(lance_core::datatypes::LANCE_UNENFORCED_PRIMARY_KEY_POSITION);
+                f.as_ref()
+                    .clone()
+                    .with_nullable(true)
+                    .with_metadata(metadata)
+            })
             .collect()
     };
     Schema::new(vec![
@@ -4771,6 +4787,89 @@ mod tests {
         pairs.sort_unstable();
 
         assert_eq!(pairs, vec![(1, 10), (2, 200), (3, 300), (4, 400)]);
+    }
+
+    /// knowdb #1088: a conditional ("update if") merge_insert on a table with
+    /// an unenforced primary key, on the plain and the indexed-join path. The
+    /// condition's combined schema made the key column nullable while keeping
+    /// its marker, so parsing the condition failed `verify_primary_key`.
+    #[tokio::test]
+    async fn test_update_if_on_a_table_with_an_unenforced_primary_key() {
+        for indexed in [false, true] {
+            let id_field = Field::new("id", DataType::Int32, false).with_metadata(
+                [(
+                    "lance-schema:unenforced-primary-key".to_string(),
+                    "true".to_string(),
+                )]
+                .into(),
+            );
+            let value_field = Field::new("value", DataType::Int32, false);
+            let schema = Arc::new(Schema::new(vec![id_field, value_field]));
+            let initial = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(Int32Array::from(vec![10, 20, 30])),
+                ],
+            )
+            .unwrap();
+            let mut dataset = Dataset::write(
+                RecordBatchIterator::new(vec![Ok(initial)], schema.clone()),
+                &format!("memory://update_if_pk_{indexed}"),
+                None,
+            )
+            .await
+            .unwrap();
+            if indexed {
+                dataset
+                    .create_index(
+                        &["id"],
+                        IndexType::Scalar,
+                        None,
+                        &ScalarIndexParams::default(),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let dataset = Arc::new(dataset);
+            // id 2 keeps its value (the condition is false), id 3 changes.
+            let new_batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![2, 3])),
+                    Arc::new(Int32Array::from(vec![20, 300])),
+                ],
+            )
+            .unwrap();
+            let mut builder = MergeInsertBuilder::try_new(dataset.clone(), Vec::new()).unwrap();
+            builder
+                .when_matched(
+                    WhenMatched::update_if(&dataset, "source.value != target.value").unwrap(),
+                )
+                .when_not_matched(WhenNotMatched::DoNothing);
+            let job = builder.try_build().unwrap();
+            let stream = reader_to_stream(Box::new(RecordBatchIterator::new(
+                [Ok(new_batch)],
+                schema.clone(),
+            )));
+            let (updated, stats) = job.execute(stream).await.unwrap();
+            assert_eq!(stats.num_updated_rows, 1, "indexed={indexed}");
+            let batch = updated.scan().try_into_batch().await.unwrap();
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_primitive::<Int32Type>();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_primitive::<Int32Type>();
+            let mut pairs = (0..ids.len())
+                .map(|i| (ids.value(i), values.value(i)))
+                .collect::<Vec<_>>();
+            pairs.sort_unstable();
+            assert_eq!(pairs, vec![(1, 10), (2, 20), (3, 300)], "indexed={indexed}");
+        }
     }
 
     #[rstest::rstest]
