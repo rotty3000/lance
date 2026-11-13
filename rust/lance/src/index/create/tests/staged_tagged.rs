@@ -1516,11 +1516,13 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     for value in 100..104 {
         assert_eq!(RowAddress::from(live[&value]).fragment_id(), destination);
     }
-    assert_eq!(
-        merged.dataset_version, old.dataset_version,
-        "the merge keeps the oldest source stamp (below the legacy version)"
-    );
-    assert!(merged.dataset_version < legacy_versions(&dataset).await[0].dataset_version);
+    // knowdb #801 (fork, cfb97d5fa): a merge that remapped every source row
+    // through the FRI stamps the version it READ, not the oldest source's
+    // (upstream keeps the oldest: the conservative side). The merged file
+    // holds live addresses, so the trim below drops the legacy version(s)
+    // and indexed queries still equal the scan.
+    assert!(merged.dataset_version > old.dataset_version);
+    assert!(merged.dataset_version > legacy_versions(&dataset).await[0].dataset_version);
     // Provenance union: the old segment's listed bitmap {0, 1, destination}
     // and the newer segment's fragments (the two partition destinations and
     // the appended fragment).
@@ -1542,12 +1544,8 @@ async fn v0_deferred_segment_merges_into_live_addresses_after_upgrade() {
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
     assert_eq!(
         legacy_versions(&dataset).await.len(),
-        1,
-        "the legacy version stays pinned until a remap advances the stamp"
-    );
-    assert_eq!(
-        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
-        RoaringBitmap::from_iter([2u32, 3, destination])
+        0,
+        "the merge's stamp caught the segment up (knowdb #801)"
     );
     let dataset = fresh_session(dir.as_str()).await;
     assert_eq!(
@@ -1648,10 +1646,12 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
             "i = {value} lives in the second destination"
         );
     }
-    assert_eq!(
-        merged.dataset_version, old.dataset_version,
-        "the merge keeps the oldest source stamp"
-    );
+    // knowdb #801 (fork, cfb97d5fa): a merge that remapped every source row
+    // through the FRI stamps the version it READ, not the oldest source's
+    // (upstream keeps the oldest: the conservative side). The merged file
+    // holds live addresses, so the trim below drops the legacy version(s)
+    // and indexed queries still equal the scan.
+    assert!(merged.dataset_version > old.dataset_version);
     assert_eq!(
         merged.fragment_bitmap.as_ref().unwrap(),
         &(old_listed.fragment_bitmap.clone().unwrap() | newer.fragment_bitmap.clone().unwrap()),
@@ -1663,10 +1663,10 @@ async fn two_v0_deferred_rounds_merge_and_trim_after_upgrade() {
     // sources and destinations of both rounds.
     let mut dataset = dataset;
     cleanup_frag_reuse_index(&mut dataset).await.unwrap();
-    assert_eq!(legacy_versions(&dataset).await.len(), 2);
     assert_eq!(
-        fri_entry(&dataset).await.unwrap().fragment_bitmap.unwrap(),
-        RoaringBitmap::from_iter([0u32, 1, 2, 3, first_destination, second_destination])
+        legacy_versions(&dataset).await.len(),
+        0,
+        "the merge's stamp caught the segment up (knowdb #801)"
     );
     let dataset = fresh_session(dir.as_str()).await;
     assert_scalar_queries_match(&dataset).await;
