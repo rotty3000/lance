@@ -3903,6 +3903,16 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
             .await?;
         let mut indices = indices.as_ref().clone();
         for idx in indices.iter_mut() {
+            // knowdb#1090: never remap the FRI's own entry. Its bitmap is the
+            // union of every retained version's NEW fragments, so a chained
+            // rewrite (version 2 rewrites fragments version 1 created) holds
+            // only part of a later group's old fragments: every load logged
+            // a straddle "heal" (spike2: up to 145k WARN/h) and rewrote a
+            // bitmap no reader resolves rows through. Upstream main
+            // (682fc4171, 2026-11-13, `index/loading.rs`) still remaps it.
+            if idx.name == FRAG_REUSE_INDEX_NAME {
+                continue;
+            }
             if let Some(bitmap) = idx.fragment_bitmap.as_mut() {
                 frag_reuse_index.remap_fragment_bitmap(bitmap)?;
             }

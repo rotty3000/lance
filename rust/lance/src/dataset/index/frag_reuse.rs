@@ -1453,6 +1453,56 @@ mod tests {
         ));
     }
 
+    /// knowdb#1090: loading the indices leaves the FRI's own coverage as
+    /// committed. It is the union of every retained version's new fragments,
+    /// and after a chained rewrite a remap would treat it as a straddling
+    /// index (a WARN per load) and rewrite it.
+    #[tokio::test]
+    async fn test_load_indices_keeps_the_frag_reuse_index_bitmap() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(6), FragmentRowCount::from(1000))
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::Scalar,
+                Some("scalar".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+        // Two deferred rewrites, the second over the first one's output.
+        for target_rows_per_fragment in [2_000, 6_000] {
+            compact_files(
+                &mut dataset,
+                CompactionOptions {
+                    target_rows_per_fragment,
+                    defer_index_remap: true,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let fri = dataset
+            .load_index_by_name(FRAG_REUSE_INDEX_NAME)
+            .await
+            .unwrap()
+            .expect("the deferred rewrites created the FRI");
+        let details = load_frag_reuse_index_details(&dataset, &fri).await.unwrap();
+        assert_eq!(details.versions.len(), 2, "the rewrites chained");
+        let committed: RoaringBitmap = details
+            .versions
+            .iter()
+            .flat_map(|v| v.new_frag_bitmap())
+            .collect();
+        assert_eq!(fri.fragment_bitmap.as_ref(), Some(&committed));
+    }
+
     /// An index whose catch-up check errors (here: it covers only part of a
     /// rewrite group) must pin the reuse version, not drop it. Dropping a version
     /// some index still needs stops readers remapping addresses that are still
